@@ -1,0 +1,48 @@
+[workspace]
+name = "restate"
+version = "0.1.0"
+authors = ["Marius S <marius@seritan.net>"]
+description = "Durable execution flows in Mojo via Restate: the Rust SDK owns the event loop and journal behind a C-ABI shim; business logic is Mojo."
+preview = ["pixi-build"]
+channels = [
+    "https://conda.modular.com/max-nightly",
+    "conda-forge",
+]
+platforms = ["osx-arm64"]
+
+[dependencies]
+mojo = "==1.0.0"
+# The FFI shim is a pixi package (ffi/); pixi builds the Rust cdylib and
+# installs lib/librestatemojo.dylib into the env — no manual build step.
+restate-shim = { path = "ffi" }
+
+[tasks]
+counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
+build-example = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter"
+# End-to-end gate: boots a throwaway restate-server via npx, registers the
+# counter endpoint, and asserts state/sleep/run behavior.
+it = "bash test/integration.sh"
+
+# ── pixi-build: consumable as a pixi source dependency ──────────────────────
+# Conda package name is restate-mojo (restate is the upstream product name);
+# the Mojo import stays `from restate import …`.
+[package]
+name = "restate-mojo"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.build.config.pkg]
+path = "src/restate"
+name = "restate"
+
+[package.host-dependencies]
+mojo-compiler = "==1.0.0"
+
+[package.build-dependencies]
+mojo-compiler = "==1.0.0"
+
+[package.run-dependencies]
+mojo-compiler = "==1.0.0"
+restate-shim = { path = "ffi" }

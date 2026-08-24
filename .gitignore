@@ -1,0 +1,4 @@
+.pixi/
+build/
+ffi/target/
+*.conda

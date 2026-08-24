@@ -1,0 +1,22 @@
+# Builds the Restate FFI shim as a conda artifact: cargo compiles the cdylib
+# (restate-sdk + tokio inside) and it installs into $PREFIX/lib, where the
+# Mojo binding's _find_lib() dlopens it.
+package:
+  name: restate-shim
+  version: 0.1.0
+
+source:
+  - path: .
+    use_gitignore: true
+
+build:
+  number: 0
+  script:
+    - cargo build --release
+    - mkdir -p $PREFIX/lib
+    - cp target/release/librestatemojo.dylib $PREFIX/lib/librestatemojo.dylib
+    - install_name_tool -id "@rpath/librestatemojo.dylib" "$PREFIX/lib/librestatemojo.dylib"
+
+requirements:
+  build:
+    - rust

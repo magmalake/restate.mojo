@@ -1,0 +1,6 @@
+name = "restate-mojo"
+version = "0.1.0"
+description = "Durable execution flows in Mojo via Restate: Rust SDK event loop and journal behind a C-ABI shim, business logic in Mojo"
+tags = ["durable-execution", "workflows", "restate", "ffi"]
+# other books this one depends on; omit if none
+books = []

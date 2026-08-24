@@ -81,7 +81,7 @@ shared (use promises to signal between them).
 - Built/tested on osx-arm64 with `mojo == 1.0.0`. Workflow mode is wired
   through discovery but has no end-to-end gate yet.
 
-## Install as a mojoshelf book
+## Install as a mojoshelf tin
 
 ```sh
 pixi shelf add restate-mojo     # pixi mode (builds shim + .mojopkg)

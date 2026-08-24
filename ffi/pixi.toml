@@ -1,6 +1,6 @@
 [package]
 name = "restate-shim"
-version = "0.1.0"
+version = "0.1.1"
 description = "Rust cdylib FFI shim for restate-mojo: librestatemojo.dylib embedding the Restate SDK, dlopened at runtime"
 
 [package.build]

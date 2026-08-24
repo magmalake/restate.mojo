@@ -16,7 +16,11 @@ from restate import App, is_suspended
 
 
 def main() raises:
-    var app = App("Counter", ["add", "get", "slowadd", "stamp"], object=True)
+    var app = App(
+        "Counter",
+        ["add", "get", "slowadd", "stamp", "wait_signal", "get_signal"],
+        object=True,
+    )
     print("Counter listening on :9080 — register with `restate deployments register`")
     while True:
         var inv = app.next()
@@ -43,6 +47,18 @@ def main() raises:
                     stamp = app.run_exit(inv, stamp)
                 app.set_state(inv, "stamp", stamp)
                 app.complete(inv, stamp)
+            elif inv.handler == "wait_signal":
+                # Durable external signal: create an awakeable, publish its id
+                # (here: stdout; real code hands it out via run/call), then
+                # await resolution from the outside world.
+                var aid = app.awakeable_create(inv)
+                print("awakeable-id:", aid)
+                var value = app.awakeable_await(inv, aid)
+                app.set_state(inv, "signal", value)
+                app.complete(inv, value)
+            elif inv.handler == "get_signal":
+                var sig = app.get_state(inv, "signal")
+                app.complete(inv, sig.value() if sig else String("none"))
             else:
                 app.fail(inv, "unknown handler: " + inv.handler)
         except e:

@@ -48,8 +48,17 @@ curl -X POST localhost:8080/Counter/alice/get -d '""'    # -> 1
 | `app.call(inv, service, handler, payload, key="")` | durable request/response to another service |
 | `app.send(...)` | durable one-way message, optionally delayed |
 | `app.run_enter / run_exit` | journaled side effect: executed once, replayed on retry |
+| `app.awakeable_create / awakeable_await` | durable promise resolvable from outside (services or the ingress `/restate/awakeables/<id>/resolve` API) |
+| `app.awakeable_resolve / awakeable_reject` | resolve/reject another invocation's awakeable |
+| `app.promise_await / promise_peek / promise_resolve / promise_reject` | named durable promises between a workflow's `run` handler and its shared handlers |
+| `app.cancel_invocation` | cancel another invocation by id (`inv.id` carries this invocation's) |
 | `app.complete / app.fail` | finish the invocation (success / terminal error) |
 | `app.abandon` | drop after suspension; Restate resumes with journal replay |
+
+Service flavors: `App(..., object=True)` (default) is a Virtual Object;
+`object=False` a stateless Service; `workflow=True` a Workflow, whose
+handler named `run` executes once per key while the other handlers are
+shared (use promises to signal between them).
 
 ## Semantics you must respect
 
@@ -67,9 +76,10 @@ curl -X POST localhost:8080/Counter/alice/get -d '""'    # -> 1
   **`call`-ing a handler served by the same driver process deadlocks** (the
   loop is blocked waiting for the call while the callee waits for the loop).
   Call out to other endpoints/services only.
-- Services and virtual objects; no workflows, awakeables, or promises yet
-  (the shim's `ContextInternal` surface has them — contributions welcome).
-- Built/tested on osx-arm64 with `mojo == 1.0.0`.
+- Payloads are raw bytes: what the outside world sends is what you get
+  (JSON `"x"` arrives with its quotes) — parse/serialize in your handler.
+- Built/tested on osx-arm64 with `mojo == 1.0.0`. Workflow mode is wired
+  through discovery but has no end-to-end gate yet.
 
 ## Install as a mojoshelf book
 

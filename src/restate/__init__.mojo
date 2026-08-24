@@ -96,6 +96,7 @@ struct Invocation(Copyable, Movable):
     var handle: Int
     var handler: String
     var key: String
+    var id: String
     var input: List[UInt8]
 
     def input_string(self) -> String:
@@ -113,12 +114,16 @@ struct App(Movable):
         service: String,
         handlers: List[String],
         object: Bool = True,
+        workflow: Bool = False,
         host: String = "0.0.0.0",
         port: Int = 9080,
     ) raises:
         """Start the endpoint (background thread in the shim). `object=True`
         registers a Virtual Object — keyed, with state and single-writer
-        concurrency per key; `False` a plain (stateless) Service."""
+        concurrency per key; `False` a plain (stateless) Service.
+        `workflow=True` registers a Workflow: the handler named "run" is the
+        workflow handler (runs once per key), the rest are shared and may use
+        the promise operations to signal it."""
         self.lib = OwnedDLHandle(_find_lib())
         var addr = host + ":" + String(port)
         var names = String("")
@@ -129,11 +134,16 @@ struct App(Movable):
         var addr_c = _cstr(addr)
         var service_c = _cstr(service)
         var names_c = _cstr(names)
+        var ty = 0
+        if workflow:
+            ty = 2
+        elif object:
+            ty = 1
         var serve_fn = self.lib.get_function[Int]("rst_serve")
         var status = serve_fn(
             Int(addr_c.unsafe_ptr()),
             Int(service_c.unsafe_ptr()),
-            Int(1) if object else Int(0),
+            ty,
             Int(names_c.unsafe_ptr()),
         )
         _ = addr_c^
@@ -194,9 +204,12 @@ struct App(Movable):
         var key_fn = self.lib.get_function[Int]("rst_inv_key")
         self._check(key_fn(handle), "inv_key")
         var key = _bytes_to_string(self._buf())
+        var id_fn = self.lib.get_function[Int]("rst_inv_id")
+        self._check(id_fn(handle), "inv_id")
+        var inv_id = _bytes_to_string(self._buf())
         var input_fn = self.lib.get_function[Int]("rst_inv_input")
         self._check(input_fn(handle), "inv_input")
-        return Invocation(handle, handler^, key^, self._buf())
+        return Invocation(handle, handler^, key^, inv_id^, self._buf())
 
     # ── durable context operations ─────────────────────────────────────────
 
@@ -335,6 +348,97 @@ struct App(Movable):
         _ = handler_c^
         _ = payload_b^
         self._check(status, "send")
+
+    def awakeable_create(self, inv: Invocation) raises -> String:
+        """Create an awakeable — a durable promise resolvable from outside
+        (another service, or the ingress HTTP API). Returns its id: hand it
+        to the outside world (inside `run_enter`/`run_exit` or via `call`),
+        then `awakeable_await` it."""
+        var func = self.lib.get_function[Int]("rst_awakeable_create")
+        self._check(func(inv.handle), "awakeable_create")
+        return _bytes_to_string(self._buf())
+
+    def awakeable_await(self, inv: Invocation, id: String) raises -> String:
+        """Await an awakeable created in this invocation; returns its
+        resolved payload. Suspends if unresolved."""
+        var id_c = _cstr(id)
+        var func = self.lib.get_function[Int]("rst_awakeable_await")
+        var status = func(inv.handle, Int(id_c.unsafe_ptr()))
+        _ = id_c^
+        self._check(status, "awakeable_await")
+        return _bytes_to_string(self._buf())
+
+    def awakeable_resolve(self, inv: Invocation, id: String, value: String) raises:
+        """Resolve another invocation's awakeable with a payload."""
+        var id_c = _cstr(id)
+        var value_b = _string_to_bytes(value)
+        var func = self.lib.get_function[Int]("rst_awakeable_resolve")
+        var status = func(
+            inv.handle, Int(id_c.unsafe_ptr()), Int(value_b.unsafe_ptr()), len(value_b)
+        )
+        _ = id_c^
+        _ = value_b^
+        self._check(status, "awakeable_resolve")
+
+    def awakeable_reject(self, inv: Invocation, id: String, message: String) raises:
+        """Reject another invocation's awakeable with a terminal error."""
+        var id_c = _cstr(id)
+        var message_c = _cstr(message)
+        var func = self.lib.get_function[Int]("rst_awakeable_reject")
+        var status = func(inv.handle, Int(id_c.unsafe_ptr()), Int(message_c.unsafe_ptr()))
+        _ = id_c^
+        _ = message_c^
+        self._check(status, "awakeable_reject")
+
+    def promise_await(self, inv: Invocation, name: String) raises -> String:
+        """Await a named workflow promise (workflow services only)."""
+        var name_c = _cstr(name)
+        var func = self.lib.get_function[Int]("rst_promise_await")
+        var status = func(inv.handle, Int(name_c.unsafe_ptr()))
+        _ = name_c^
+        self._check(status, "promise_await")
+        return _bytes_to_string(self._buf())
+
+    def promise_peek(self, inv: Invocation, name: String) raises -> Optional[String]:
+        """Peek a named workflow promise: its value, or None if unresolved."""
+        var name_c = _cstr(name)
+        var func = self.lib.get_function[Int]("rst_promise_peek")
+        var status = func(inv.handle, Int(name_c.unsafe_ptr()))
+        _ = name_c^
+        if status == STATUS_EMPTY:
+            return None
+        self._check(status, "promise_peek")
+        return _bytes_to_string(self._buf())
+
+    def promise_resolve(self, inv: Invocation, name: String, value: String) raises:
+        """Resolve a named workflow promise (from a shared handler)."""
+        var name_c = _cstr(name)
+        var value_b = _string_to_bytes(value)
+        var func = self.lib.get_function[Int]("rst_promise_resolve")
+        var status = func(
+            inv.handle, Int(name_c.unsafe_ptr()), Int(value_b.unsafe_ptr()), len(value_b)
+        )
+        _ = name_c^
+        _ = value_b^
+        self._check(status, "promise_resolve")
+
+    def promise_reject(self, inv: Invocation, name: String, message: String) raises:
+        """Reject a named workflow promise with a terminal error."""
+        var name_c = _cstr(name)
+        var message_c = _cstr(message)
+        var func = self.lib.get_function[Int]("rst_promise_reject")
+        var status = func(inv.handle, Int(name_c.unsafe_ptr()), Int(message_c.unsafe_ptr()))
+        _ = name_c^
+        _ = message_c^
+        self._check(status, "promise_reject")
+
+    def cancel_invocation(self, inv: Invocation, invocation_id: String) raises:
+        """Cancel another invocation by id."""
+        var id_c = _cstr(invocation_id)
+        var func = self.lib.get_function[Int]("rst_cancel_invocation")
+        var status = func(inv.handle, Int(id_c.unsafe_ptr()))
+        _ = id_c^
+        self._check(status, "cancel_invocation")
 
     def run_enter(self, inv: Invocation) raises -> Optional[String]:
         """Enter a journaled side-effect block. Returns the journaled value

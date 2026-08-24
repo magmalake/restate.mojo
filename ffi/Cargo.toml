@@ -1,6 +1,6 @@
 [package]
 name = "restatemojo"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "C-ABI shim over the restate-sdk crate, for the restate.mojo Mojo binding."
 

@@ -18,7 +18,7 @@ cd "$ROOT"
 mkdir -p build
 mojo build examples/counter.mojo -I src -o build/counter
 
-./build/counter & COUNTER_PID=$!
+./build/counter > "$WORK/counter.log" 2>&1 & COUNTER_PID=$!
 ( cd "$WORK" && exec npx -y @restatedev/restate-server ) > "$WORK/server.log" 2>&1 & SERVER_PID=$!
 
 echo "waiting for restate-server admin (:9070)..."
@@ -47,4 +47,21 @@ expect "get bob"       "0" "$(curl -s -X POST localhost:8080/Counter/bob/get -d 
 expect "slowadd"       "3" "$(curl -s -X POST localhost:8080/Counter/alice/slowadd -d '""')"
 expect "stamp"         "stamp-for-alice" "$(curl -s -X POST localhost:8080/Counter/alice/stamp -d '""')"
 
-echo "PASS — durable state, sleep, and run journaling through the Mojo bridge"
+# Awakeable: fire wait_signal asynchronously, resolve it from ingress.
+curl -sf -X POST localhost:8080/Counter/dave/wait_signal/send -d '""' > /dev/null
+for _ in $(seq 1 20); do
+    AID="$(grep -m1 '^awakeable-id: ' "$WORK/counter.log" | awk '{print $2}' || true)"
+    [ -n "${AID:-}" ] && break
+    sleep 1
+done
+[ -n "${AID:-}" ] || { echo "FAIL: no awakeable id surfaced" >&2; exit 1; }
+curl -sf -X POST "localhost:8080/restate/awakeables/$AID/resolve" \
+    -H "content-type: application/json" -d '"pinged"' > /dev/null
+for _ in $(seq 1 20); do
+    GOT="$(curl -s -X POST localhost:8080/Counter/dave/get_signal -d '""')"
+    [ "$GOT" = "\"pinged\"" ] && break
+    sleep 1
+done
+expect "awakeable resolved" "\"pinged\"" "$GOT"
+
+echo "PASS — durable state, sleep, run journaling, and awakeables through the Mojo bridge"

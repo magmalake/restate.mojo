@@ -57,6 +57,15 @@ enum Cmd {
     Send { target: RequestTarget, payload: Vec<u8>, delay_ms: u64 },
     RunEnter,
     RunExit(Vec<u8>),
+    AwakeableCreate,
+    AwakeableAwait(String),
+    AwakeableResolve(String, Vec<u8>),
+    AwakeableReject(String, String),
+    PromiseAwait(String),
+    PromisePeek(String),
+    PromiseResolve(String, Vec<u8>),
+    PromiseReject(String, String),
+    CancelInvocation(String),
     Complete(Vec<u8>),
     Fail(String),
 }
@@ -71,6 +80,7 @@ enum Reply {
 struct Job {
     handler: String,
     key: String,
+    invocation_id: String,
     input: Vec<u8>,
     cmd_tx: tmpsc::UnboundedSender<Cmd>,
     reply_rx: smpsc::Receiver<Reply>,
@@ -146,6 +156,7 @@ impl Service for DynamicService {
                 .send(Job {
                     handler: ctx.handler_name().to_string(),
                     key: metadata.key.clone(),
+                    invocation_id: metadata.invocation_id.clone(),
                     input,
                     cmd_tx,
                     reply_rx,
@@ -155,6 +166,13 @@ impl Service for DynamicService {
                 // No Mojo driver: nothing we can do.
                 return Ok(());
             }
+
+            // Awakeables created but not yet awaited by the Mojo driver.
+            // The futures borrow `ctx`, which outlives them in this block.
+            let mut awakeables: HashMap<
+                String,
+                std::pin::Pin<Box<dyn futures::Future<Output = Result<Vec<u8>, TerminalError>> + Send + '_>>,
+            > = HashMap::new();
 
             loop {
                 let Some(cmd) = cmd_rx.recv().await else {
@@ -229,6 +247,59 @@ impl Service for DynamicService {
                                 .into(),
                         ));
                     }
+                    Cmd::AwakeableCreate => {
+                        let (id, fut) = ctx.awakeable::<Vec<u8>>();
+                        awakeables.insert(id.clone(), Box::pin(fut));
+                        let _ = reply_tx.send(Reply::Ok(id.into_bytes()));
+                    }
+                    Cmd::AwakeableAwait(id) => {
+                        let reply = match awakeables.remove(&id) {
+                            Some(fut) => match fut.await {
+                                Ok(v) => Reply::Ok(v),
+                                Err(te) => Reply::Terminal(te.to_string()),
+                            },
+                            None => Reply::Terminal(format!(
+                                "restate.mojo protocol error: unknown awakeable '{id}' \
+                                 (create it in this invocation first)"
+                            )),
+                        };
+                        let _ = reply_tx.send(reply);
+                    }
+                    Cmd::AwakeableResolve(id, value) => {
+                        ctx.resolve_awakeable::<Vec<u8>>(&id, value);
+                        let _ = reply_tx.send(Reply::Ok(Vec::new()));
+                    }
+                    Cmd::AwakeableReject(id, msg) => {
+                        ctx.reject_awakeable(&id, TerminalError::new(msg));
+                        let _ = reply_tx.send(Reply::Ok(Vec::new()));
+                    }
+                    Cmd::PromiseAwait(name) => {
+                        let r = ctx.promise::<Vec<u8>>(&name).await;
+                        let _ = reply_tx.send(match r {
+                            Ok(v) => Reply::Ok(v),
+                            Err(te) => Reply::Terminal(te.to_string()),
+                        });
+                    }
+                    Cmd::PromisePeek(name) => {
+                        let r = ctx.peek_promise::<Vec<u8>>(&name).await;
+                        let _ = reply_tx.send(match r {
+                            Ok(Some(v)) => Reply::Ok(v),
+                            Ok(None) => Reply::Empty,
+                            Err(te) => Reply::Terminal(te.to_string()),
+                        });
+                    }
+                    Cmd::PromiseResolve(name, value) => {
+                        ctx.resolve_promise::<Vec<u8>>(&name, value);
+                        let _ = reply_tx.send(Reply::Ok(Vec::new()));
+                    }
+                    Cmd::PromiseReject(name, msg) => {
+                        ctx.reject_promise(&name, TerminalError::new(msg));
+                        let _ = reply_tx.send(Reply::Ok(Vec::new()));
+                    }
+                    Cmd::CancelInvocation(id) => {
+                        ctx.cancel_invocation(&id);
+                        let _ = reply_tx.send(Reply::Ok(Vec::new()));
+                    }
                     Cmd::Complete(bytes) => {
                         ctx.handle_handler_result::<Vec<u8>>(Ok(bytes));
                         ctx.end();
@@ -249,12 +320,14 @@ impl Service for DynamicService {
     }
 }
 
-fn make_discovery(service_name: &str, object: bool, handlers: &[String]) -> discovery::Service {
+/// service_ty: 0 = Service, 1 = Virtual Object, 2 = Workflow (the handler
+/// named "run" is the workflow handler; all others are shared).
+fn make_discovery(service_name: &str, service_ty: i32, handlers: &[String]) -> discovery::Service {
     discovery::Service {
-        ty: if object {
-            discovery::ServiceType::VirtualObject
-        } else {
-            discovery::ServiceType::Service
+        ty: match service_ty {
+            1 => discovery::ServiceType::VirtualObject,
+            2 => discovery::ServiceType::Workflow,
+            _ => discovery::ServiceType::Service,
         },
         name: discovery::ServiceName::try_from(service_name.to_string())
             .expect("service name valid"),
@@ -264,7 +337,15 @@ fn make_discovery(service_name: &str, object: bool, handlers: &[String]) -> disc
                 name: discovery::HandlerName::try_from(h.as_str()).expect("handler name valid"),
                 input: Some(discovery::InputPayload::from_metadata::<Vec<u8>>()),
                 output: Some(discovery::OutputPayload::from_metadata::<Vec<u8>>()),
-                ty: None,
+                ty: if service_ty == 2 {
+                    if h == "run" {
+                        Some(discovery::HandlerType::Workflow)
+                    } else {
+                        Some(discovery::HandlerType::Shared)
+                    }
+                } else {
+                    None
+                },
                 documentation: None,
                 metadata: Default::default(),
                 abort_timeout: None,
@@ -301,13 +382,14 @@ fn make_discovery(service_name: &str, object: bool, handlers: &[String]) -> disc
 
 /// Start the Restate endpoint on `host_port` (e.g. "0.0.0.0:9080"), serving
 /// one service with the given comma-separated handler names.
-/// `object` != 0 registers a Virtual Object (keyed, with state); 0 a Service.
+/// `service_ty`: 0 = Service, 1 = Virtual Object, 2 = Workflow (whose "run"
+/// handler is the workflow handler; the rest are shared).
 /// Non-blocking: the server runs on a background thread.
 #[no_mangle]
 pub extern "C" fn rst_serve(
     host_port: *const c_char,
     service_name: *const c_char,
-    object: i32,
+    service_ty: i32,
     handlers_csv: *const c_char,
 ) -> i32 {
     let (Ok(addr), Ok(name), Ok(handlers)) = (
@@ -344,7 +426,7 @@ pub extern "C" fn rst_serve(
         return STATUS_ERROR;
     }
 
-    let discovery = make_discovery(&name, object != 0, &handlers);
+    let discovery = make_discovery(&name, service_ty, &handlers);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -468,6 +550,14 @@ pub extern "C" fn rst_inv_input(handle: u64) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn rst_inv_id(handle: u64) -> i32 {
+    with_invocation(handle, |inv| {
+        set_scratch(inv.job.invocation_id.clone().into_bytes());
+        STATUS_OK
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn rst_sleep(handle: u64, millis: u64) -> i32 {
     simple_op(handle, Cmd::Sleep(millis))
 }
@@ -561,6 +651,111 @@ pub extern "C" fn rst_send(
     };
     let payload = unsafe { bytes(payload, payload_len) };
     simple_op(handle, Cmd::Send { target, payload, delay_ms: delay_millis })
+}
+
+/// Create an awakeable: a durable, externally-resolvable promise. Returns
+/// its id in rst_buf; hand the id to the outside world (via rst_run/rst_call),
+/// then rst_awakeable_await it.
+#[no_mangle]
+pub extern "C" fn rst_awakeable_create(handle: u64) -> i32 {
+    simple_op(handle, Cmd::AwakeableCreate)
+}
+
+/// Await an awakeable created in this invocation; its resolved payload lands
+/// in rst_buf.
+#[no_mangle]
+pub extern "C" fn rst_awakeable_await(handle: u64, id: *const c_char) -> i32 {
+    let Ok(id) = (unsafe { cstr(id) }) else {
+        set_error("rst_awakeable_await: null id");
+        return STATUS_ERROR;
+    };
+    simple_op(handle, Cmd::AwakeableAwait(id))
+}
+
+/// Resolve someone else's awakeable with a payload (journaled).
+#[no_mangle]
+pub extern "C" fn rst_awakeable_resolve(
+    handle: u64,
+    id: *const c_char,
+    value: *const u8,
+    value_len: usize,
+) -> i32 {
+    let Ok(id) = (unsafe { cstr(id) }) else {
+        set_error("rst_awakeable_resolve: null id");
+        return STATUS_ERROR;
+    };
+    let value = unsafe { bytes(value, value_len) };
+    simple_op(handle, Cmd::AwakeableResolve(id, value))
+}
+
+/// Reject someone else's awakeable with a terminal error (journaled).
+#[no_mangle]
+pub extern "C" fn rst_awakeable_reject(handle: u64, id: *const c_char, message: *const c_char) -> i32 {
+    let (Ok(id), Ok(msg)) = (unsafe { cstr(id) }, unsafe { cstr(message) }) else {
+        set_error("rst_awakeable_reject: null argument");
+        return STATUS_ERROR;
+    };
+    simple_op(handle, Cmd::AwakeableReject(id, msg))
+}
+
+/// Await a named workflow promise (workflow services only).
+#[no_mangle]
+pub extern "C" fn rst_promise_await(handle: u64, name: *const c_char) -> i32 {
+    let Ok(name) = (unsafe { cstr(name) }) else {
+        set_error("rst_promise_await: null name");
+        return STATUS_ERROR;
+    };
+    simple_op(handle, Cmd::PromiseAwait(name))
+}
+
+/// Peek a named workflow promise: STATUS_OK with the value, or STATUS_EMPTY.
+#[no_mangle]
+pub extern "C" fn rst_promise_peek(handle: u64, name: *const c_char) -> i32 {
+    let Ok(name) = (unsafe { cstr(name) }) else {
+        set_error("rst_promise_peek: null name");
+        return STATUS_ERROR;
+    };
+    simple_op(handle, Cmd::PromisePeek(name))
+}
+
+/// Resolve a named workflow promise (from a shared handler).
+#[no_mangle]
+pub extern "C" fn rst_promise_resolve(
+    handle: u64,
+    name: *const c_char,
+    value: *const u8,
+    value_len: usize,
+) -> i32 {
+    let Ok(name) = (unsafe { cstr(name) }) else {
+        set_error("rst_promise_resolve: null name");
+        return STATUS_ERROR;
+    };
+    let value = unsafe { bytes(value, value_len) };
+    simple_op(handle, Cmd::PromiseResolve(name, value))
+}
+
+/// Reject a named workflow promise with a terminal error.
+#[no_mangle]
+pub extern "C" fn rst_promise_reject(
+    handle: u64,
+    name: *const c_char,
+    message: *const c_char,
+) -> i32 {
+    let (Ok(name), Ok(msg)) = (unsafe { cstr(name) }, unsafe { cstr(message) }) else {
+        set_error("rst_promise_reject: null argument");
+        return STATUS_ERROR;
+    };
+    simple_op(handle, Cmd::PromiseReject(name, msg))
+}
+
+/// Cancel another invocation by id (journaled).
+#[no_mangle]
+pub extern "C" fn rst_cancel_invocation(handle: u64, invocation_id: *const c_char) -> i32 {
+    let Ok(id) = (unsafe { cstr(invocation_id) }) else {
+        set_error("rst_cancel_invocation: null id");
+        return STATUS_ERROR;
+    };
+    simple_op(handle, Cmd::CancelInvocation(id))
 }
 
 /// Enter a journaled side-effect block. STATUS_OK: the journal already had

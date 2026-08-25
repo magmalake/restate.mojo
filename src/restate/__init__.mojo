@@ -34,6 +34,7 @@ Payloads are raw bytes on the wire; the String helpers below treat them as
 UTF-8 (use the `_bytes` variants for binary data).
 """
 
+from std.sys.info import CompilationTarget
 from std.ffi import OwnedDLHandle, c_char
 from std.os import getenv
 
@@ -56,7 +57,7 @@ def is_suspended(e: Error) -> Bool:
 def _find_lib() -> String:
     """Path to librestatemojo: `$CONDA_PREFIX/lib` (installed by the shim
     package), else the local cargo build for a bare checkout."""
-    var ext = String("dylib")  # ffi/ emits .so on Linux
+    var ext = String("dylib") if CompilationTarget.is_macos() else String("so")
     var prefix = getenv("CONDA_PREFIX", "")
     if prefix == "":
         return String("ffi/target/release/librestatemojo.") + ext

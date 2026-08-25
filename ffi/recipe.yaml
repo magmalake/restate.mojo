@@ -3,7 +3,7 @@
 # Mojo binding's _find_lib() dlopens it.
 package:
   name: restate-shim
-  version: 0.1.1
+  version: 0.1.2
 
 source:
   - path: .
@@ -14,8 +14,7 @@ build:
   script:
     - cargo build --release
     - mkdir -p $PREFIX/lib
-    - cp target/release/librestatemojo.dylib $PREFIX/lib/librestatemojo.dylib
-    - install_name_tool -id "@rpath/librestatemojo.dylib" "$PREFIX/lib/librestatemojo.dylib"
+    - if [ -f target/release/librestatemojo.dylib ]; then cp target/release/librestatemojo.dylib $PREFIX/lib/librestatemojo.dylib && install_name_tool -id "@rpath/librestatemojo.dylib" "$PREFIX/lib/librestatemojo.dylib"; else cp target/release/librestatemojo.so $PREFIX/lib/librestatemojo.so; fi
 
 requirements:
   build:

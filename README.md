@@ -1,5 +1,7 @@
 # restate.mojo
 
+[![mojoshelf](https://mojoshelf.org/badge/restate-mojo.svg)](https://mojoshelf.org/tins/restate-mojo) [![mojo nightly](https://mojoshelf.org/badge/restate-mojo/nightly.svg)](https://mojoshelf.org/tins/restate-mojo)
+
 Durable execution flows in **Mojo**, via [Restate](https://restate.dev).
 
 The Rust shim (`ffi/`) embeds the official Restate Rust SDK: Rust owns the
@@ -87,3 +89,6 @@ shared (use promises to signal between them).
 pixi shelf add restate-mojo     # pixi mode (builds shim + .mojopkg)
 shelf add restate-mojo          # or as a git submodule
 ```
+
+Maintainers release new versions with `shelf publish` from the repo root
+(see [getting started](https://mojoshelf.org/getting-started)).

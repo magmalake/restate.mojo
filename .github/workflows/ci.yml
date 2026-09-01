@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shim is a Rust cdylib built by pixi as a source dependency.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ffi
+
+      # Both gates boot a real restate-server through npx.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          pixi-version: v0.71.1
+
+      - name: Compile the examples
+        run: pixi run build-example
+
+      # Ports are overridable so a developer's own restate-server is never
+      # touched; CI has the machine to itself but sets them anyway.
+      - name: Integration gate
+        env:
+          RESTATE_IT_INGRESS: 18080
+          RESTATE_IT_ADMIN: 19070
+          RESTATE_IT_NODE: 15122
+          RESTATE_IT_ENDPOINT: 19080
+        run: pixi run it
+
+      - name: Served gate (concurrency, and the self-call that used to deadlock)
+        env:
+          RESTATE_IT_INGRESS: 28080
+          RESTATE_IT_ADMIN: 29070
+          RESTATE_IT_NODE: 25122
+          RESTATE_IT_ENDPOINT: 29080
+        run: pixi run it-served

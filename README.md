@@ -1,6 +1,6 @@
 # restate.mojo
 
-[![mojoshelf](https://mojoshelf.org/badge/restate-mojo.svg)](https://mojoshelf.org/tins/restate-mojo) [![mojo nightly](https://mojoshelf.org/badge/restate-mojo/nightly.svg)](https://mojoshelf.org/tins/restate-mojo)
+[![CI](https://github.com/millfolio/restate.mojo/actions/workflows/ci.yml/badge.svg)](https://github.com/millfolio/restate.mojo/actions/workflows/ci.yml) [![mojoshelf](https://mojoshelf.org/badge/restate-mojo.svg)](https://mojoshelf.org/tins/restate-mojo) [![mojo nightly](https://mojoshelf.org/badge/restate-mojo/nightly.svg)](https://mojoshelf.org/tins/restate-mojo)
 
 Durable execution flows in **Mojo**, via [Restate](https://restate.dev).
 
@@ -138,7 +138,8 @@ shared (use promises to signal between them).
   `serve(num_workers=1)` — still deadlocks if a handler `call`s a handler
   served by the same process. That is inherent: there is no second thread to
   run the callee. Use `serve` with two or more workers.
-- Built/tested on osx-arm64 with `mojo == 1.0.0`. Workflow mode is wired
+- CI runs both end-to-end gates on macOS and Linux with `mojo == 1.0.0`;
+  linux-64 was previously untested and passes. Workflow mode is wired
   through discovery but has no end-to-end gate yet.
 
 ## Tests

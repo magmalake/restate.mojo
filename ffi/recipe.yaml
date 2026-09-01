@@ -3,7 +3,7 @@
 # Mojo binding's _find_lib() dlopens it.
 package:
   name: restate-shim
-  version: 0.1.2
+  version: 0.2.0
 
 source:
   - path: .

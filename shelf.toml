@@ -1,6 +1,6 @@
 name = "restate-mojo"
-version = "0.1.2"
-description = "Durable execution flows in Mojo via Restate: Rust SDK event loop and journal behind a C-ABI shim, business logic in Mojo"
-tags = ["durable-execution", "workflows", "restate", "ffi"]
+version = "0.2.0"
+description = "Durable execution flows in Mojo via Restate: Rust SDK event loop and journal behind a C-ABI shim, business logic in Mojo, served on one thread or N"
+tags = ["durable-execution", "workflows", "restate", "ffi", "concurrency"]
 # other tins this one depends on; omit if none
-tins = []
+tins = ["threads-mojo"]

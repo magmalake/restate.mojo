@@ -1,8 +1,8 @@
 [workspace]
 name = "restate"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Marius S <marius@seritan.net>"]
-description = "Durable execution flows in Mojo via Restate: the Rust SDK owns the event loop and journal behind a C-ABI shim; business logic is Mojo."
+description = "Durable execution flows in Mojo via Restate: the Rust SDK owns the event loop and journal behind a C-ABI shim; business logic is Mojo, on one thread or N."
 preview = ["pixi-build"]
 channels = [
     "https://conda.modular.com/max-nightly",
@@ -15,20 +15,29 @@ mojo = "==1.0.0"
 # The FFI shim is a pixi package (ffi/); pixi builds the Rust cdylib and
 # installs lib/librestatemojo.dylib into the env — no manual build step.
 restate-shim = { path = "ffi" }
+# Pinned at the revision mojoshelf published, NOT local HEAD: `pixi shelf add`
+# resolves the tin's own deps at the published rev, and a mismatch gives two
+# source records for one package ("encountered duplicate records for
+# threads-mojo-…_source.conda").
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "d05cbff21e25b817607a33edb2f3c9e8fc696964" }
 
 [tasks]
 counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
 build-example = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter"
+chain = "mkdir -p build && mojo build examples/chain.mojo -I src -o build/chain && ./build/chain"
 # End-to-end gate: boots a throwaway restate-server via npx, registers the
 # counter endpoint, and asserts state/sleep/run behavior.
 it = "bash test/integration.sh"
+# End-to-end gate for served mode: self-calls (the old deadlock), genuine
+# overlap between invocations, and stop() unwinding the driver.
+it-served = "bash test/served.sh"
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
 # Conda package name is restate-mojo (restate is the upstream product name);
 # the Mojo import stays `from restate import …`.
 [package]
 name = "restate-mojo"
-version = "0.1.2"
+version = "0.2.0"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -36,9 +45,14 @@ backend = { name = "pixi-build-mojo", version = "0.*" }
 [package.build.config.pkg]
 path = "src/restate"
 name = "restate"
+# pixi-build-mojo 0.2.4 does not put host dependencies' .mojopkg on the Mojo
+# import path, so `from threads import …` fails at package-build time without
+# this. The backend template is `mojo package {{ pkg.extra_args }} …`.
+extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.0.0"
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "d05cbff21e25b817607a33edb2f3c9e8fc696964" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.0.0"
@@ -46,3 +60,4 @@ mojo-compiler = "==1.0.0"
 [package.run-dependencies]
 mojo-compiler = "==1.0.0"
 restate-shim = { path = "ffi" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "d05cbff21e25b817607a33edb2f3c9e8fc696964" }

@@ -12,16 +12,34 @@ Restate server and invoke it:
 retries.
 """
 
+from std.sys import argv
+
 from restate import App, is_suspended
 
 
 def main() raises:
+    var port = 9080
+    var args = argv()
+    var i = 1
+    while i < len(args):
+        if String(args[i]) == "--port" and i + 1 < len(args):
+            port = Int(String(args[i + 1]))
+            i += 2
+        else:
+            raise Error("unknown option: ", String(args[i]))
+
     var app = App(
         "Counter",
         ["add", "get", "slowadd", "stamp", "wait_signal", "get_signal"],
         object=True,
+        port=port,
     )
-    print("Counter listening on :9080 — register with `restate deployments register`")
+    print(
+        "Counter listening on :",
+        port,
+        " — register with `restate deployments register`",
+        sep="",
+    )
     while True:
         var inv = app.next()
         try:

@@ -22,6 +22,23 @@ business logic, driven by a synchronous loop:
                 if not is_suspended(e):
                     raise e
 
+That loop is single-threaded, and a handler that `call`s another handler served
+by the same process therefore deadlocks. `App.serve` is the concurrent form —
+the same loop on N threads, via threads-mojo's `WorkerPool`:
+
+    from restate import App, Invocation, OpaquePtr
+
+    def handle(app: App, inv: Invocation, worker: Int, ctx: OpaquePtr) raises:
+        app.complete(inv, "ok")
+
+    def main() raises:
+        var app = App("Counter", ["add", "get"], object=True)
+        _ = app.serve[handle](num_workers=4)   # until app.stop()
+
+With two or more workers one thread can wait for a call while another runs the
+callee, so self-calls complete. See `HandlerFn` for the handler's obligations
+and `App.stop` for how a worker parked in `next()` is released.
+
 Semantics: on retry or resume, Restate re-invokes the handler and replays the
 journal — ctx operations (`sleep`, `call`, `get_state`, `run_*`, ...) return
 their journaled results instantly, so handler logic must be deterministic
@@ -34,9 +51,20 @@ Payloads are raw bytes on the wire; the String helpers below treat them as
 UTF-8 (use the `_bytes` variants for binary data).
 """
 
+from std.memory import alloc
 from std.sys.info import CompilationTarget
 from std.ffi import OwnedDLHandle, c_char
 from std.os import getenv
+
+from threads import (
+    AtomicCounter,
+    AtomicFlag,
+    OpaquePtr,
+    WorkerPool,
+    i64_ptr,
+    num_cpus,
+    opaque_ptr,
+)
 
 comptime STATUS_OK = 0
 comptime STATUS_GONE = 1
@@ -46,12 +74,19 @@ comptime STATUS_EMPTY = 4
 comptime STATUS_EXECUTE = 5
 
 comptime SUSPENDED_MSG = "restate: invocation suspended"
+comptime STOPPED_MSG = "restate: driver stopped"
 
 
 def is_suspended(e: Error) -> Bool:
     """True if `e` is the suspension signal (abandon the invocation and keep
     serving)."""
     return String(e) == SUSPENDED_MSG
+
+
+def is_stopped(e: Error) -> Bool:
+    """True if `e` means `stop()` was called: `next()` will not deliver
+    anything more, so leave the loop."""
+    return String(e) == STOPPED_MSG
 
 
 def _find_lib() -> String:
@@ -194,10 +229,20 @@ struct App(Movable):
         raise Error("restate " + what + " failed: " + self._last_error())
 
     def next(self) raises -> Invocation:
-        """Block until Restate delivers the next invocation."""
+        """Block until Restate delivers the next invocation.
+
+        Safe to call from several threads at once — the shim's job receiver is
+        behind a mutex and hands each invocation to exactly one caller. That is
+        what `serve` is built on.
+
+        Raises the `is_stopped` sentinel once `stop()` has been called, so a
+        driver loop can tell an orderly shutdown from a real failure.
+        """
         var next_fn = self.lib.get_function[Int]("rst_next")
         var handle = next_fn()
         if handle == 0:
+            if self.is_stopping():
+                raise Error(STOPPED_MSG)
             raise Error("rst_next failed: " + self._last_error())
         var handler_fn = self.lib.get_function[Int]("rst_inv_handler")
         self._check(handler_fn(handle), "inv_handler")
@@ -231,13 +276,17 @@ struct App(Movable):
         self._check(status, "get_state")
         return self._buf()
 
-    def get_state(self, inv: Invocation, key: String) raises -> Optional[String]:
+    def get_state(
+        self, inv: Invocation, key: String
+    ) raises -> Optional[String]:
         var b = self.get_state_bytes(inv, key)
         if b:
             return _bytes_to_string(b.value())
         return None
 
-    def get_state_int(self, inv: Invocation, key: String, default: Int) raises -> Int:
+    def get_state_int(
+        self, inv: Invocation, key: String, default: Int
+    ) raises -> Int:
         var s = self.get_state(inv, key)
         if s:
             return Int(s.value())
@@ -249,7 +298,10 @@ struct App(Movable):
         var key_c = _cstr(key)
         var func = self.lib.get_function[Int]("rst_set_state")
         var status = func(
-            inv.handle, Int(key_c.unsafe_ptr()), Int(value.unsafe_ptr()), len(value)
+            inv.handle,
+            Int(key_c.unsafe_ptr()),
+            Int(value.unsafe_ptr()),
+            len(value),
         )
         _ = key_c^
         self._check(status, "set_state")
@@ -369,24 +421,33 @@ struct App(Movable):
         self._check(status, "awakeable_await")
         return _bytes_to_string(self._buf())
 
-    def awakeable_resolve(self, inv: Invocation, id: String, value: String) raises:
+    def awakeable_resolve(
+        self, inv: Invocation, id: String, value: String
+    ) raises:
         """Resolve another invocation's awakeable with a payload."""
         var id_c = _cstr(id)
         var value_b = _string_to_bytes(value)
         var func = self.lib.get_function[Int]("rst_awakeable_resolve")
         var status = func(
-            inv.handle, Int(id_c.unsafe_ptr()), Int(value_b.unsafe_ptr()), len(value_b)
+            inv.handle,
+            Int(id_c.unsafe_ptr()),
+            Int(value_b.unsafe_ptr()),
+            len(value_b),
         )
         _ = id_c^
         _ = value_b^
         self._check(status, "awakeable_resolve")
 
-    def awakeable_reject(self, inv: Invocation, id: String, message: String) raises:
+    def awakeable_reject(
+        self, inv: Invocation, id: String, message: String
+    ) raises:
         """Reject another invocation's awakeable with a terminal error."""
         var id_c = _cstr(id)
         var message_c = _cstr(message)
         var func = self.lib.get_function[Int]("rst_awakeable_reject")
-        var status = func(inv.handle, Int(id_c.unsafe_ptr()), Int(message_c.unsafe_ptr()))
+        var status = func(
+            inv.handle, Int(id_c.unsafe_ptr()), Int(message_c.unsafe_ptr())
+        )
         _ = id_c^
         _ = message_c^
         self._check(status, "awakeable_reject")
@@ -400,7 +461,9 @@ struct App(Movable):
         self._check(status, "promise_await")
         return _bytes_to_string(self._buf())
 
-    def promise_peek(self, inv: Invocation, name: String) raises -> Optional[String]:
+    def promise_peek(
+        self, inv: Invocation, name: String
+    ) raises -> Optional[String]:
         """Peek a named workflow promise: its value, or None if unresolved."""
         var name_c = _cstr(name)
         var func = self.lib.get_function[Int]("rst_promise_peek")
@@ -411,24 +474,33 @@ struct App(Movable):
         self._check(status, "promise_peek")
         return _bytes_to_string(self._buf())
 
-    def promise_resolve(self, inv: Invocation, name: String, value: String) raises:
+    def promise_resolve(
+        self, inv: Invocation, name: String, value: String
+    ) raises:
         """Resolve a named workflow promise (from a shared handler)."""
         var name_c = _cstr(name)
         var value_b = _string_to_bytes(value)
         var func = self.lib.get_function[Int]("rst_promise_resolve")
         var status = func(
-            inv.handle, Int(name_c.unsafe_ptr()), Int(value_b.unsafe_ptr()), len(value_b)
+            inv.handle,
+            Int(name_c.unsafe_ptr()),
+            Int(value_b.unsafe_ptr()),
+            len(value_b),
         )
         _ = name_c^
         _ = value_b^
         self._check(status, "promise_resolve")
 
-    def promise_reject(self, inv: Invocation, name: String, message: String) raises:
+    def promise_reject(
+        self, inv: Invocation, name: String, message: String
+    ) raises:
         """Reject a named workflow promise with a terminal error."""
         var name_c = _cstr(name)
         var message_c = _cstr(message)
         var func = self.lib.get_function[Int]("rst_promise_reject")
-        var status = func(inv.handle, Int(name_c.unsafe_ptr()), Int(message_c.unsafe_ptr()))
+        var status = func(
+            inv.handle, Int(name_c.unsafe_ptr()), Int(message_c.unsafe_ptr())
+        )
         _ = name_c^
         _ = message_c^
         self._check(status, "promise_reject")
@@ -488,3 +560,196 @@ struct App(Movable):
             _ = func(inv.handle)
         except:
             pass
+
+    # ── shutdown ───────────────────────────────────────────────────────────
+
+    def stop(self) raises:
+        """Unblock every `next()` — in this thread or any other — so driver
+        loops can end.
+
+        Setting a flag in Mojo cannot reach a thread parked inside the shim's
+        blocking receiver, so this goes through the shim (`rst_stop`), which
+        sets a process-wide flag its receive loop rechecks. Idempotent, and
+        safe to call from inside a handler: that is how a service gives itself
+        a `shutdown` endpoint.
+
+        The endpoint itself keeps listening — this ends the Mojo driver, not
+        the HTTP server. There is no un-stop.
+        """
+        var func = self.lib.get_function[Int]("rst_stop")
+        _ = func()
+
+    def is_stopping(self) raises -> Bool:
+        """Whether `stop()` has been called.
+
+        Returns:
+            True once a stop has been requested.
+        """
+        var func = self.lib.get_function[Int]("rst_stopping")
+        return func() != 0
+
+    # ── served mode ────────────────────────────────────────────────────────
+
+    def serve[
+        handler: HandlerFn
+    ](
+        self,
+        num_workers: Int = 0,
+        ctx: OpaquePtr = opaque_ptr(0),
+    ) raises -> Int:
+        """Run `handler` on `num_workers` threads until `stop()` is called.
+
+        The concurrent counterpart to the `while True: app.next()` loop, and
+        the reason a handler may now `call` another handler served by this same
+        process: with two or more workers, one thread waits for the callee
+        while another picks it up. With one worker that is still a deadlock,
+        exactly as before.
+
+        Blocks until every worker has left its loop, then returns.
+
+        Parameters:
+            handler: The handler body — `def(App, Invocation, Int, OpaquePtr)
+                thin raises -> None`, receiving the app, the invocation, its
+                worker index, and `ctx`. Thin (non-capturing), because it is
+                reached through a thread start routine; see the module
+                docstring for the shape and the obligations.
+
+        Args:
+            num_workers: How many driver threads. `0` (the default) means
+                `num_cpus()`. **Use at least 2** if any handler calls back into
+                this process.
+            ctx: Process-local state shared by every handler invocation,
+                passed straight through. Must outlive the `serve` call — which
+                it does automatically, since `serve` joins before returning.
+                Defaults to a null pointer for handlers that need none.
+
+        Returns:
+            How many invocations completed without raising.
+
+        Raises:
+            Error: If the workers cannot be started or joined.
+        """
+        var n = num_workers if num_workers > 0 else num_cpus()
+        if n < 1:
+            n = 1
+
+        # Heap allocated, and freed only after the join: the workers read it
+        # for as long as they run, and Mojo destroys a local at its last *use*.
+        var block = alloc[Int64](_SERVE_CELLS)
+        var cells = i64_ptr(Int(block))
+        # The App's own address. Every worker borrows it back through a
+        # pointer rather than receiving a copy — `App` owns an `OwnedDLHandle`,
+        # and a copy (or a move) would let one worker `dlclose` the library
+        # while another is inside a call through it.
+        cells[_SERVE_APP] = Int64(Int(UnsafePointer(to=self)))
+        cells[_SERVE_USER] = Int64(Int(ctx))
+        cells[_SERVE_SERVED] = 0
+        cells[_SERVE_ERRORS] = 0
+        var shared = opaque_ptr(Int(block))
+
+        var pool: WorkerPool
+        try:
+            pool = WorkerPool.start[_serve_worker[handler]](n, shared)
+        except e:
+            block.unsafe_free()
+            raise Error("restate serve could not start workers: ", String(e))
+
+        # No `request_stop()` here: the workers leave when `next()` reports the
+        # stop, which is the only signal that can reach a thread parked in the
+        # shim's receiver. The pool's flag would never be observed by a worker
+        # blocked in that call.
+        try:
+            pool.join()
+        except e:
+            block.unsafe_free()
+            raise Error("restate serve could not join workers: ", String(e))
+
+        var served = Int(cells[_SERVE_SERVED])
+        block.unsafe_free()
+        return served
+
+
+# ── served mode: the handler contract and its plumbing ──────────────────────
+
+
+comptime HandlerFn = def(App, Invocation, Int, OpaquePtr) thin raises -> None
+"""What `App.serve` runs for each invocation: `(app, inv, worker, ctx)`.
+
+**Thin**, i.e. non-capturing — it is reached through a pthread start routine,
+which takes a C function pointer and one `void *`. Anything the handler needs
+beyond the app and the invocation travels through `ctx`, exactly as in
+`threads.parallel_for`.
+
+It *may* raise, unlike a raw thread body: `serve` wraps each call, so a raise
+is caught, the invocation is `abandon`ed (Restate re-delivers it), and the
+worker carries on. Suspension arrives this way too — `is_suspended(e)` — and is
+not logged, because it is normal.
+
+A handler must finish its invocation: `complete`, `fail`, or raise. Returning
+without doing any of those leaks the invocation handle in the shim and leaves
+Restate waiting.
+"""
+
+
+# Worker context layout for `serve`, in 64-bit cells.
+comptime _SERVE_APP: Int = 0
+"""Address of the caller's `App` — borrowed, never copied."""
+comptime _SERVE_USER: Int = 1
+"""Address of the caller's own context, passed through to the handler."""
+comptime _SERVE_SERVED: Int = 2
+"""Atomic count of invocations that completed without raising."""
+comptime _SERVE_ERRORS: Int = 3
+"""Atomic count of invocations whose handler raised."""
+comptime _SERVE_CELLS: Int = 4
+
+
+def _serve_one[
+    handler: HandlerFn
+](
+    app: App,
+    var inv: Invocation,
+    worker: Int,
+    user_ctx: OpaquePtr,
+    served: AtomicCounter,
+    errors: AtomicCounter,
+) -> None:
+    """Run one invocation and swallow whatever it throws.
+
+    `app` is a plain borrow. That is the whole point of this function existing
+    separately: the worker holds only a raw address for the `App`, and passing
+    `app_ptr[]` into a borrowing parameter is what keeps the `OwnedDLHandle`
+    from being moved out from under the other workers.
+    """
+    try:
+        handler(app, inv, worker, user_ctx)
+        _ = served.fetch_add(1)
+    except e:
+        # Suspension is routine: Restate parked the invocation and will
+        # re-deliver it with journal replay. Anything else is worth seeing.
+        app.abandon(inv)
+        _ = errors.fetch_add(1)
+        if not is_suspended(e):
+            print("restate: handler error in", inv.handler, "-", e)
+
+
+def _serve_worker[
+    handler: HandlerFn
+](worker: Int, ctx: OpaquePtr, stop: AtomicFlag) -> None:
+    """One driver thread: pull invocations and run them until stopped."""
+    var cells = i64_ptr(Int(ctx))
+    var app = UnsafePointer[App, MutUntrackedOrigin](
+        unsafe_from_address=Int(cells[_SERVE_APP])
+    )
+    var user_ctx = opaque_ptr(Int(cells[_SERVE_USER]))
+    var served = AtomicCounter.at(Int(ctx) + _SERVE_SERVED * 8)
+    var errors = AtomicCounter.at(Int(ctx) + _SERVE_ERRORS * 8)
+    while not stop.is_set():
+        try:
+            var inv = app[].next()
+            _serve_one[handler](app[], inv^, worker, user_ctx, served, errors)
+        except:
+            # `next()` raised: either `stop()` was called, or the endpoint
+            # died. Both mean this worker is finished. The pool's own stop flag
+            # is checked above but can never be what releases a worker parked
+            # in `next()` — see `App.stop`.
+            break

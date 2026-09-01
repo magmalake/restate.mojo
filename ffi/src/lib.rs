@@ -16,6 +16,30 @@
 //! the Mojo driver then abandons that invocation; Restate will re-invoke it
 //! later with journal replay.
 //!
+//! ## N Mojo driver threads
+//!
+//! That loop may be run by several Mojo threads at once, which is what makes a
+//! handler able to `rst_call` another handler served by this same process. The
+//! pieces that makes possible, all of them load bearing:
+//!
+//! - `job_rx` is a `Mutex<Receiver<Job>>` — the canonical N-consumer pattern
+//!   over an mpsc receiver. One caller at a time waits in the receiver; the
+//!   rest queue on the mutex. Nothing is lost and nothing is duplicated.
+//! - the invocation map hands out `Arc<Mutex<Job>>`, and callers **clone the
+//!   Arc under the map lock and then release it** before doing anything that
+//!   blocks. Holding the map lock across a `rst_call` would serialise every
+//!   driver thread behind the caller and reintroduce the very deadlock this
+//!   exists to remove. One invocation is owned by one driver thread at a time,
+//!   so the per-invocation mutex is uncontended; it is there because
+//!   `mpsc::Receiver` is `Send` but not `Sync`.
+//! - `SCRATCH` and `LAST_ERROR` are thread-locals, so the result buffer one
+//!   driver thread reads back through `rst_buf_ptr` cannot be clobbered by
+//!   another thread's operation.
+//!
+//! Shutdown: a thread parked in `rst_next` cannot see a flag in Mojo, so
+//! `rst_stop` sets a process-wide flag here and `rst_next` waits on a short
+//! timeout rather than indefinitely — see `rst_stop`.
+//!
 //! Payloads are raw bytes end to end (Vec<u8> implements the SDK serde).
 
 use futures::future::BoxFuture;
@@ -28,8 +52,8 @@ use restate_sdk::service::{macro_support, Service};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc as smpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc as smpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc as tmpsc;
 
@@ -87,25 +111,40 @@ struct Job {
 }
 
 struct Bridge {
+    /// Held, never read: keeping a sender alive here is what stops the job
+    /// channel from ever reporting `Disconnected`, so `rst_next` blocks rather
+    /// than spinning when no invocation is in flight. It is also why dropping
+    /// the sender is not available as a shutdown mechanism — hence `rst_stop`.
+    #[allow(dead_code)]
     job_tx: smpsc::Sender<Job>,
     job_rx: Mutex<smpsc::Receiver<Job>>,
 }
 
 static BRIDGE: OnceLock<Bridge> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Set by `rst_stop`; makes every `rst_next` caller return 0 so the Mojo
+/// worker threads can leave their loops.
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
-struct Invocation {
-    job: Job,
-}
+/// How long `rst_next` parks in the receiver before rechecking `STOPPING`.
+/// A job still wakes it immediately — this only bounds shutdown latency.
+const NEXT_POLL: Duration = Duration::from_millis(25);
 
-fn invocations() -> &'static Mutex<HashMap<u64, Invocation>> {
-    static INVS: OnceLock<Mutex<HashMap<u64, Invocation>>> = OnceLock::new();
+/// One in-flight invocation, shared by handle.
+///
+/// `Arc` so a driver thread can keep working on it after the map lock is
+/// released; `Mutex` because `mpsc::Receiver` is `Send` but not `Sync`, and
+/// because one invocation must be driven by one thread at a time anyway.
+type InvocationRef = Arc<Mutex<Job>>;
+
+fn invocations() -> &'static Mutex<HashMap<u64, InvocationRef>> {
+    static INVS: OnceLock<Mutex<HashMap<u64, InvocationRef>>> = OnceLock::new();
     INVS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// The Mojo driver is single-threaded: a thread-local scratch holds the last
-// result buffer and error text, read back via rst_buf_ptr/rst_buf_len and
-// rst_last_error.
+// Per-thread scratch: the last result buffer and error text, read back via
+// rst_buf_ptr/rst_buf_len and rst_last_error. Thread-local precisely so that N
+// Mojo driver threads cannot clobber each other's results.
 thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
@@ -445,19 +484,59 @@ pub extern "C" fn rst_serve(
     STATUS_OK
 }
 
-/// Block until the next invocation arrives; returns its handle (> 0), or 0
-/// on error (bridge not started / channel closed).
+/// Ask every `rst_next` caller to return 0, so the Mojo driver threads can
+/// leave their serve loops. Idempotent, and safe to call from a handler.
+///
+/// This exists because a cooperative stop flag on the Mojo side cannot reach a
+/// thread that is parked inside this shim's receiver: setting a flag does not
+/// interrupt a blocking `recv`. The alternatives were dropping the sender
+/// (impossible — `BRIDGE` is a `OnceLock` static, and the SDK service holds a
+/// clone for the life of the endpoint) or pushing N sentinel jobs (requires
+/// knowing N, and races a worker that is mid-invocation). A flag plus a short
+/// receive timeout needs neither, and costs one wakeup every 25 ms per idle
+/// worker. A job still arrives with no added latency.
+#[no_mangle]
+pub extern "C" fn rst_stop() -> i32 {
+    STOPPING.store(true, Ordering::Release);
+    STATUS_OK
+}
+
+/// Whether `rst_stop` has been called — lets the Mojo side tell an orderly
+/// shutdown apart from a genuine `rst_next` failure.
+#[no_mangle]
+pub extern "C" fn rst_stopping() -> i32 {
+    i32::from(STOPPING.load(Ordering::Acquire))
+}
+
+/// Block until the next invocation arrives; returns its handle (> 0), or 0 on
+/// error (bridge not started / channel closed) or after `rst_stop`.
+///
+/// Safe to call from several threads at once: the receiver is behind a mutex,
+/// so exactly one caller waits in it and the others queue on the lock. Each
+/// invocation is handed to exactly one caller.
 #[no_mangle]
 pub extern "C" fn rst_next() -> u64 {
     let Some(bridge) = BRIDGE.get() else {
         set_error("rst_next: rst_serve was not called");
         return 0;
     };
-    let job = {
+    let job = loop {
+        if STOPPING.load(Ordering::Acquire) {
+            set_error("rst_next: stopping");
+            return 0;
+        }
         let rx = bridge.job_rx.lock().expect("job_rx lock");
-        match rx.recv() {
-            Ok(j) => j,
-            Err(_) => {
+        // Recheck after acquiring: a stop may have landed while we queued
+        // behind another worker, and this keeps shutdown from costing one
+        // NEXT_POLL per waiting thread.
+        if STOPPING.load(Ordering::Acquire) {
+            set_error("rst_next: stopping");
+            return 0;
+        }
+        match rx.recv_timeout(NEXT_POLL) {
+            Ok(j) => break j,
+            Err(smpsc::RecvTimeoutError::Timeout) => continue,
+            Err(smpsc::RecvTimeoutError::Disconnected) => {
                 set_error("rst_next: endpoint stopped");
                 return 0;
             }
@@ -467,16 +546,24 @@ pub extern "C" fn rst_next() -> u64 {
     invocations()
         .lock()
         .expect("invocations lock")
-        .insert(id, Invocation { job });
+        .insert(id, Arc::new(Mutex::new(job)));
     id
 }
 
-fn with_invocation<F: FnOnce(&Invocation) -> i32>(handle: u64, f: F) -> i32 {
-    // The map lock is held for the duration of the op. The Mojo driver is
-    // single-threaded, so there is no contention in practice.
-    let invs = invocations().lock().expect("invocations lock");
-    match invs.get(&handle) {
-        Some(inv) => f(inv),
+fn with_invocation<F: FnOnce(&Job) -> i32>(handle: u64, f: F) -> i32 {
+    // Clone the Arc under the map lock, then *release it* before running `f`.
+    // `f` blocks — a `rst_call` waits for the callee to finish — so holding the
+    // map lock here would serialise every driver thread behind this one and
+    // put the deadlock straight back.
+    let entry = {
+        let invs = invocations().lock().expect("invocations lock");
+        invs.get(&handle).cloned()
+    };
+    match entry {
+        Some(inv) => {
+            let job = inv.lock().expect("invocation lock");
+            f(&job)
+        }
         None => {
             set_error("unknown invocation handle");
             STATUS_ERROR
@@ -493,11 +580,11 @@ fn drop_invocation(handle: u64) {
 
 /// Send one command and block for one reply, translating channel breakage
 /// into STATUS_GONE (the invocation was suspended or cancelled by Restate).
-fn roundtrip(inv: &Invocation, cmd: Cmd) -> Result<Reply, i32> {
-    if inv.job.cmd_tx.send(cmd).is_err() {
+fn roundtrip(job: &Job, cmd: Cmd) -> Result<Reply, i32> {
+    if job.cmd_tx.send(cmd).is_err() {
         return Err(STATUS_GONE);
     }
-    inv.job.reply_rx.recv().map_err(|_| STATUS_GONE)
+    job.reply_rx.recv().map_err(|_| STATUS_GONE)
 }
 
 fn reply_to_status(reply: Reply) -> i32 {
@@ -519,7 +606,7 @@ fn reply_to_status(reply: Reply) -> i32 {
 }
 
 fn simple_op(handle: u64, cmd: Cmd) -> i32 {
-    with_invocation(handle, |inv| match roundtrip(inv, cmd) {
+    with_invocation(handle, |job| match roundtrip(job, cmd) {
         Ok(reply) => reply_to_status(reply),
         Err(status) => status,
     })
@@ -527,32 +614,32 @@ fn simple_op(handle: u64, cmd: Cmd) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn rst_inv_handler(handle: u64) -> i32 {
-    with_invocation(handle, |inv| {
-        set_scratch(inv.job.handler.clone().into_bytes());
+    with_invocation(handle, |job| {
+        set_scratch(job.handler.clone().into_bytes());
         STATUS_OK
     })
 }
 
 #[no_mangle]
 pub extern "C" fn rst_inv_key(handle: u64) -> i32 {
-    with_invocation(handle, |inv| {
-        set_scratch(inv.job.key.clone().into_bytes());
+    with_invocation(handle, |job| {
+        set_scratch(job.key.clone().into_bytes());
         STATUS_OK
     })
 }
 
 #[no_mangle]
 pub extern "C" fn rst_inv_input(handle: u64) -> i32 {
-    with_invocation(handle, |inv| {
-        set_scratch(inv.job.input.clone());
+    with_invocation(handle, |job| {
+        set_scratch(job.input.clone());
         STATUS_OK
     })
 }
 
 #[no_mangle]
 pub extern "C" fn rst_inv_id(handle: u64) -> i32 {
-    with_invocation(handle, |inv| {
-        set_scratch(inv.job.invocation_id.clone().into_bytes());
+    with_invocation(handle, |job| {
+        set_scratch(job.invocation_id.clone().into_bytes());
         STATUS_OK
     })
 }

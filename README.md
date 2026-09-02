@@ -10,24 +10,26 @@ driven by a synchronous loop — every durable operation crosses one C-ABI call.
 Run that loop on one thread, or on N with `app.serve`.
 
 ```mojo
-from restate import App, is_suspended
+from restate import App, Ctx, Invocation, Unit
+
+def handle_add(app: App, inv: Invocation, worker: Int, ctx: Ctx[Unit]) raises:
+    var n = app.get_state_int(inv, "count", 0) + 1
+    app.set_state_int(inv, "count", n)
+    app.complete(inv, String(n))
+
+def handle_get(app: App, inv: Invocation, worker: Int, ctx: Ctx[Unit]) raises:
+    app.complete(inv, String(app.get_state_int(inv, "count", 0)))
 
 def main() raises:
-    var app = App("Counter", ["add", "get"], object=True)
-    while True:
-        var inv = app.next()          # block until Restate invokes a handler
-        try:
-            if inv.handler == "add":
-                var n = app.get_state_int(inv, "count", 0) + 1
-                app.set_state_int(inv, "count", n)
-                app.complete(inv, String(n))
-            elif inv.handler == "get":
-                app.complete(inv, String(app.get_state_int(inv, "count", 0)))
-        except e:
-            app.abandon(inv)          # suspended/cancelled: Restate re-delivers
-            if not is_suspended(e):
-                raise e
+    var nothing = Unit()
+    _ = App.run[Unit, __functions_in_module()]("Counter", nothing)
 ```
+
+`App.run` finds every `handle_*` in the module, registers each under the name
+after the prefix, and dispatches by that name across a pool of worker threads.
+There is no list of handler names to keep in step with the handlers, and no
+`if inv.handler == ...` chain — both are derived at compile time from the same
+functions.
 
 Or hand the loop to `serve`, which runs it on N threads:
 
@@ -49,11 +51,16 @@ def main() raises:
 
 ## Serving concurrently
 
-`app.serve[handler](num_workers)` runs the same `next()` loop on `num_workers`
-OS threads ([threads-mojo](https://github.com/magmalake/threads.mojo)'s
-`WorkerPool`), and returns the number of invocations that completed once
-`app.stop()` has been called. The single-threaded `while True: app.next()` loop
-is untouched and still supported — `serve` is an addition, not a replacement.
+`App.run` serves on `num_workers` OS threads
+([threads-mojo](https://github.com/magmalake/threads.mojo)'s `WorkerPool`),
+defaulting to one per core, and returns the number of invocations that
+completed once `app.stop()` has been called.
+
+**There is no single-threaded driver.** Until 0.3.0 you could write the loop
+yourself over `app.next()`; it deadlocked the moment a handler called another
+handler in the same process, because there was no second thread to run the
+callee, and nothing in the API said so. `serve` with two or more workers is
+the only shape now, and it is the default.
 
 | piece | shape |
 |---|---|
@@ -100,7 +107,6 @@ curl -X POST localhost:8080/Counter/alice/get -d '""'    # -> 1
 
 | operation | durable semantics |
 |---|---|
-| `app.next()` | block until the next invocation (handler, key, input bytes) |
 | `app.sleep_ms(inv, ms)` | journaled timer; long sleeps suspend the invocation |
 | `app.get_state / set_state / clear_state` | virtual-object K/V state (`_bytes`/`_int` variants) |
 | `app.call(inv, service, handler, payload, key="")` | durable request/response to another service |
@@ -163,10 +169,9 @@ invocation for good.
 
 - Payloads are raw bytes: what the outside world sends is what you get
   (JSON `"x"` arrives with its quotes) — parse/serialize in your handler.
-- A **single-worker** driver — the `while True: app.next()` loop, or
-  `serve(num_workers=1)` — still deadlocks if a handler `call`s a handler
-  served by the same process. That is inherent: there is no second thread to
-  run the callee. Use `serve` with two or more workers.
+- **`num_workers=1` still deadlocks** if a handler `call`s a handler served by
+  the same process — there is no second thread to run the callee. The default
+  is one worker per core, so you have to ask for this to happen.
 - CI runs both end-to-end gates on macOS and Linux with `mojo == 1.0.0`;
   linux-64 was previously untested and passes. Workflow mode is wired
   through discovery but has no end-to-end gate yet.

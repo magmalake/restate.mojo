@@ -7,20 +7,8 @@ business logic, driven by a synchronous loop:
     from restate import App
 
     def main() raises:
-        var app = App("Counter", ["add", "get"], object=True)
-        while True:
-            var inv = app.next()
-            try:
-                if inv.handler == "add":
-                    var n = app.get_state_int(inv, "count", 0) + 1
-                    app.set_state_int(inv, "count", n)
-                    app.complete(inv, String(n))
-                elif inv.handler == "get":
-                    app.complete(inv, String(app.get_state_int(inv, "count", 0)))
-            except e:
-                app.abandon(inv)
-                if not is_suspended(e):
-                    raise e
+        var stats = Stats(0)
+        _ = App.run[Stats, __functions_in_module()]("Counter", stats)
 
 That loop is single-threaded, and a handler that `call`s another handler served
 by the same process therefore deadlocks. `App.serve` is the concurrent form —
@@ -55,6 +43,7 @@ from std.memory import alloc
 from std.sys.info import CompilationTarget
 from std.ffi import OwnedDLHandle, c_char
 from std.os import getenv
+from std.reflection import get_function_name
 
 from threads import (
     AtomicCounter,
@@ -228,7 +217,7 @@ struct App(Movable):
             )
         raise Error("restate " + what + " failed: " + self._last_error())
 
-    def next(self) raises -> Invocation:
+    def _next(self) raises -> Invocation:
         """Block until Restate delivers the next invocation.
 
         Safe to call from several threads at once — the shim's job receiver is
@@ -658,6 +647,61 @@ struct App(Movable):
 
     # ── served mode ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def run[
+        T: AnyType, funcs: Tuple, /
+    ](
+        service: String,
+        ref state: T,
+        object: Bool = True,
+        workflow: Bool = False,
+        host: String = "0.0.0.0",
+        port: Int = 9080,
+        num_workers: Int = 0,
+    ) raises -> Int:
+        """Discover the module's handlers, serve them, and block until stopped.
+
+        The whole driver:
+
+            @fieldwise_init
+            struct Stats(Copyable, Movable):
+                var seen: Int64
+
+            def handle_add(app: App, inv: Invocation, w: Int, ctx: Ctx[Stats]) raises:
+                app.complete(inv, String("ok"))
+
+            def main() raises:
+                var stats = Stats(0)
+                _ = App.run[Stats, __functions_in_module()]("Counter", stats)
+
+        Every `handle_*` in the calling module is registered under its name
+        without the prefix and dispatched to by that name. There is no list to
+        keep in step with the handlers, because there is no list.
+
+        Pass `__functions_in_module()` for `funcs`. `state` is process-local
+        and shared by every worker — see `Ctx`.
+
+        Returns how many invocations completed without raising.
+        """
+        var names = List[String]()
+        _handler_names[funcs](names)
+        if len(names) == 0:
+            raise Error(
+                "restate: no handlers found — name them handle_<something> in"
+                " the module you pass __functions_in_module() from"
+            )
+        var app = App(
+            service,
+            names,
+            object=object,
+            workflow=workflow,
+            host=host,
+            port=port,
+        )
+        return app.serve_with[T, _dispatch[T, funcs]](
+            state, num_workers=num_workers
+        )
+
     def serve_with[
         T: AnyType,
         handler: def(App, Invocation, Int, Ctx[T]) thin raises -> None,
@@ -764,6 +808,18 @@ struct App(Movable):
 
 
 @fieldwise_init
+struct Unit(Copyable, Movable):
+    """No process-local state.
+
+    A service that keeps everything in Restate state still has to name a type
+    for `Ctx`. `Unit` is that type, and saying it out loud is worth more than
+    it costs: it tells a reader the handlers share nothing across invocations.
+    """
+
+    pass
+
+
+@fieldwise_init
 struct Ctx[T: AnyType](Copyable, Movable):
     """A typed view of the process-local state `serve` hands to each handler.
 
@@ -836,6 +892,61 @@ def _typed_handler[
     handler(app, inv, worker, Ctx[T].from_opaque(ctx))
 
 
+
+# ── comptime handler discovery ──────────────────────────────────────────────
+#
+# A service used to declare its handlers twice: once as a list passed to `App`,
+# and again as an if-chain on `inv.handler`. Nothing kept the two in step, and
+# a handler present in one and missing from the other fails at runtime, on the
+# first request that reaches it.
+#
+# `comptime` removes the second copy. Both the registration list and the
+# dispatch are derived from the same `handle_*` functions in the module, so
+# they cannot disagree.
+
+comptime _HANDLER_PREFIX = "handle_"
+
+
+def _handler_names[funcs: Tuple, /](mut out: List[String]) raises:
+    """Every `handle_*` in the module, minus the prefix — the names Restate
+    registers, and the names invocations arrive under."""
+    comptime for i in range(len(funcs)):
+        comptime f = funcs[i]
+
+        comptime if get_function_name[f]().startswith(_HANDLER_PREFIX):
+            out.append(String(get_function_name[f]()[byte = _HANDLER_PREFIX.byte_length() :]))
+
+
+def _invoke[
+    T: AnyType,
+    f: def (App, Invocation, Int, Ctx[T]) thin raises -> None,
+](app: App, inv: Invocation, worker: Int, ctx: Ctx[T]) raises -> None:
+    f(app, inv, worker, ctx)
+
+
+def _dispatch[
+    T: AnyType, funcs: Tuple, /
+](app: App, inv: Invocation, worker: Int, ctx: Ctx[T]) raises -> None:
+    """Route one invocation to the `handle_*` function whose name matches.
+
+    An unknown handler is a terminal failure, not a retry: Restate only sends
+    what discovery advertised, so an unknown name means the two have drifted
+    and no amount of retrying will fix it.
+    """
+    comptime for i in range(len(funcs)):
+        comptime f = funcs[i]
+
+        comptime if get_function_name[f]().startswith(_HANDLER_PREFIX):
+            if inv.handler == String(
+                get_function_name[f]()[byte = _HANDLER_PREFIX.byte_length() :]
+            ):
+                _invoke[T, rebind[
+                    def (App, Invocation, Int, Ctx[T]) thin raises -> None
+                ](f)](app, inv, worker, ctx)
+                return
+    app.fail(inv, String("unknown handler: ", inv.handler))
+
+
 comptime _SERVE_APP: Int = 0
 """Address of the caller's `App` — borrowed, never copied."""
 comptime _SERVE_USER: Int = 1
@@ -889,7 +1000,7 @@ def _serve_worker[
     var errors = AtomicCounter.at(Int(ctx) + _SERVE_ERRORS * 8)
     while not stop.is_set():
         try:
-            var inv = app[].next()
+            var inv = app[]._next()
             _serve_one[handler](app[], inv^, worker, user_ctx, served, errors)
         except:
             # `next()` raised: either `stop()` was called, or the endpoint

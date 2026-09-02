@@ -93,7 +93,34 @@ every later attempt died with "protocol error: expected rst_run_exit".
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from restate import App, Invocation, is_suspended
+from restate import App, Ctx, Invocation, is_suspended
+from threads import AtomicCounter
+
+
+@fieldwise_init
+struct Flow(Copyable, Movable):
+    """Process-local state, shared by every worker.
+
+    In the old single-threaded driver these were locals in `main`. They are
+    atomics now because `serve` runs handlers on several threads at once and
+    `Ctx` types that sharing without synchronising it.
+    """
+
+    var failures_left: Int64
+    """How many more times `charge` should throw. Stands in for a flaky
+    downstream, which is why it is not in Restate state: a real outage is not
+    part of your journal."""
+    var attempt: Int64
+    """Attempts across all invocations, so the log reads as a story."""
+    var fail_times: Int64
+    """What `arm` resets `failures_left` to."""
+    var t0: Int64
+    """Process start, for the t+Ns column."""
+
+
+def _cell(ref c: Int64) -> AtomicCounter:
+    """An atomic view over one field, by name rather than by offset."""
+    return AtomicCounter.at(Int(UnsafePointer(to=c)))
 
 comptime DEFAULT_FAILURES = 1
 """How many times `charge` throws before it succeeds, unless `--fail` says
@@ -124,7 +151,7 @@ def _step_reserve(app: App, inv: Invocation, attempt: Int) raises -> String:
 
 
 def _step_charge(
-    app: App, inv: Invocation, attempt: Int, mut failures_left: Int
+    app: App, inv: Invocation, attempt: Int, ctx: Ctx[Flow]
 ) raises -> String:
     """The flaky step, with the fallible call *inside* the journal block.
 
@@ -143,8 +170,7 @@ def _step_charge(
             print("[attempt ", attempt, "] REPLAY   charge   -> ", slot.value(), sep="")
             return slot.value()
 
-        if failures_left > 0:
-            failures_left -= 1
+        if _cell(ctx[].failures_left).fetch_add(-1) > 0:
             print(
                 "[attempt ", attempt,
                 "] execute  charge   -> boom: card declined (retrying in-place)",
@@ -204,9 +230,107 @@ def _step_ship(app: App, inv: Invocation, attempt: Int) raises -> String:
     return app.run_exit(inv, String("shipped"))
 
 
+def handle_process(
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Flow]
+) raises -> None:
+    var attempt = Int(_cell(ctx[].attempt).fetch_add(1)) + 1
+    var elapsed = (perf_counter_ns() - Int(ctx[].t0)) // 1_000_000_000
+    print("--- attempt ", attempt, " at t+", elapsed, "s", sep="")
+
+    var reserved = _step_reserve(app, inv, attempt)
+    var charged = _step_charge(app, inv, attempt, ctx)
+    var shipped = _step_ship(app, inv, attempt)
+
+    app.set_state(inv, "reservation", reserved)
+    app.set_state(inv, "charge", charged)
+    app.set_state(inv, "shipment", shipped)
+    app.set_state_int(inv, "attempts", attempt)
+
+    print("[attempt ", attempt, "] done", sep="")
+    print()
+    app.complete(inv, String(reserved, " / ", charged, " / ", shipped))
+
+
+def handle_refund(
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Flow]
+) raises -> None:
+    """A step that fails for good, journaled as failed, then compensated."""
+    var attempt = Int(_cell(ctx[].attempt).fetch_add(1)) + 1
+    print("--- refund attempt ", attempt, sep="")
+    try:
+        app.complete(inv, _step_refund(app, inv, attempt))
+    except e:
+        # A suspension is not a failure: the invocation is parked waiting on
+        # something durable and will be resumed. Catch it as if the step had
+        # failed and you compensate for work that is merely in progress.
+        if is_suspended(e):
+            raise e
+        print("  compensating: ", e, sep="")
+        app.set_state(inv, "refund", String("failed: ", e))
+        app.complete(inv, String("refund failed, credit note issued"))
+
+
+def handle_notify(
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Flow]
+) raises -> None:
+    """Bounded retries: three attempts, then give up and carry on."""
+    var attempt = Int(_cell(ctx[].attempt).fetch_add(1)) + 1
+    print("--- notify attempt ", attempt, sep="")
+    try:
+        app.complete(inv, _step_notify(app, inv, attempt))
+    except e:
+        if is_suspended(e):
+            raise e
+        print("  gave up after 3 tries: ", e, sep="")
+        app.complete(inv, String("order placed, notification skipped"))
+
+
+def handle_validate(
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Flow]
+) raises -> None:
+    """Terminal: a malformed order will not become well-formed by being
+    retried, so `fail` rather than a run-block failure."""
+    var order = inv.input_string()
+    if len(order.codepoints()) <= 2:
+        print("terminal failure: empty order, not retrying")
+        app.fail(inv, "order is empty")
+    else:
+        app.complete(inv, String("accepted: ", order))
+
+
+def handle_status(
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Flow]
+) raises -> None:
+    var res = app.get_state(inv, "reservation")
+    var chg = app.get_state(inv, "charge")
+    var shp = app.get_state(inv, "shipment")
+    app.complete(
+        inv,
+        String(
+            "reservation=", res.value() if res else String("-"),
+            " charge=", chg.value() if chg else String("-"),
+            " shipment=", shp.value() if shp else String("-"),
+            " attempts=", app.get_state_int(inv, "attempts", 0),
+        ),
+    )
+
+
+def handle_arm(
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Flow]
+) raises -> None:
+    """Re-arm the flaky charge so the demo can be run again."""
+    var n = ctx[].fail_times
+    _cell(ctx[].failures_left).store(n)
+    _cell(ctx[].attempt).store(0)
+    print("re-armed: charge will fail ", n, " more times", sep="")
+    print()
+    app.complete(inv, String("armed"))
+
+
 def main() raises:
     var port = 9080
     var fail_times = DEFAULT_FAILURES
+    var workers = 0
     var args = argv()
     var i = 1
     while i < len(args):
@@ -216,121 +340,22 @@ def main() raises:
         elif String(args[i]) == "--fail" and i + 1 < len(args):
             fail_times = Int(String(args[i + 1]))
             i += 2
+        elif String(args[i]) == "--workers" and i + 1 < len(args):
+            workers = Int(String(args[i + 1]))
+            i += 2
         else:
             raise Error("unknown option: ", String(args[i]))
 
-    var app = App(
-        "Orders",
-        ["process", "refund", "notify", "validate", "status", "arm"],
-        object=True,
-        port=port,
+    var flow = Flow(
+        Int64(fail_times), 0, Int64(fail_times), Int64(perf_counter_ns())
     )
-
-    # Deliberately *not* in Restate state: this stands in for a flaky
-    # downstream service, and a real outage is not part of your journal. It
-    # lives in the process, so it survives across invocations and retries.
-    var failures_left = fail_times
-    var attempt = 0
-    var t0 = perf_counter_ns()
 
     print("Orders listening on :", port, sep="")
     print("  charge fails ", fail_times, "x before succeeding (--fail N)", sep="")
-    print("  restate deployments register http://localhost:", port, sep="")
-    print("  curl localhost:8080/Orders/order-1/process")
+    print("  curl localhost:8080/Orders/order-1/process --json '{}'")
     print()
 
-    while True:
-        var inv = app.next()
-        try:
-            if inv.handler == "process":
-                attempt += 1
-                print("--- attempt ", attempt, " at t+", (perf_counter_ns() - t0) // 1_000_000_000, "s", sep="")
-                var reserved = _step_reserve(app, inv, attempt)
-                var charged = _step_charge(app, inv, attempt, failures_left)
-                var shipped = _step_ship(app, inv, attempt)
-
-                app.set_state(inv, "reservation", reserved)
-                app.set_state(inv, "charge", charged)
-                app.set_state(inv, "shipment", shipped)
-                app.set_state_int(inv, "attempts", attempt)
-
-                print("[attempt ", attempt, "] done", sep="")
-                print()
-                app.complete(inv, String(reserved, " / ", charged, " / ", shipped))
-
-            elif inv.handler == "refund":
-                # The other half of run_fail: a step that fails for good.
-                # The failure is journaled and raised here, so the handler
-                # compensates once and completes — rather than retrying a
-                # dead gateway forever, which is what a non-terminal failure
-                # would do. Invoke it twice and it executes twice: a second
-                # invocation has its own journal; replay is within one.
-                attempt += 1
-                print("--- refund attempt ", attempt, sep="")
-                try:
-                    var receipt = _step_refund(app, inv, attempt)
-                    app.complete(inv, receipt)
-                except e:
-                    # A suspension is not a failure: the invocation is parked
-                    # waiting on something durable and will be resumed. Catch
-                    # it as if the step had failed and you compensate for work
-                    # that was still in progress.
-                    if is_suspended(e):
-                        raise e
-                    print("  compensating: ", e, sep="")
-                    app.set_state(inv, "refund", String("failed: ", e))
-                    app.complete(inv, String("refund failed, credit note issued"))
-
-            elif inv.handler == "notify":
-                # Bounded retries: three tries, then give up and carry on.
-                attempt += 1
-                print("--- notify attempt ", attempt, sep="")
-                try:
-                    app.complete(inv, _step_notify(app, inv, attempt))
-                except e:
-                    if is_suspended(e):
-                        raise e
-                    print("  gave up after 3 tries: ", e, sep="")
-                    app.complete(inv, String("order placed, notification skipped"))
-
-            elif inv.handler == "validate":
-                # Terminal: a malformed order will not become well-formed by
-                # being retried, so `fail` rather than `abandon`.
-                var order = inv.input_string()
-                if len(order.codepoints()) <= 2:
-                    print("terminal failure: empty order, not retrying")
-                    app.fail(inv, "order is empty")
-                else:
-                    app.complete(inv, String("accepted: ", order))
-
-            elif inv.handler == "status":
-                var res = app.get_state(inv, "reservation")
-                var chg = app.get_state(inv, "charge")
-                var shp = app.get_state(inv, "shipment")
-                app.complete(
-                    inv,
-                    String(
-                        "reservation=", res.value() if res else String("-"),
-                        " charge=", chg.value() if chg else String("-"),
-                        " shipment=", shp.value() if shp else String("-"),
-                        " attempts=", app.get_state_int(inv, "attempts", 0),
-                    ),
-                )
-
-            elif inv.handler == "arm":
-                failures_left = fail_times
-                attempt = 0
-                print("re-armed: charge will fail ", fail_times, " more times", sep="")
-                print()
-                app.complete(inv, String("armed"))
-
-            else:
-                app.fail(inv, String("unknown handler: ", inv.handler))
-
-        except e:
-            # Transient: hand it back and let Restate re-deliver with the
-            # journal intact. `is_suspended` is the ordinary "waiting on
-            # something durable" path, not an error worth printing.
-            app.abandon(inv)
-            if not is_suspended(e):
-                print("  -> abandoned, Restate will retry: ", e, sep="")
+    var served = App.run[Flow, __functions_in_module()](
+        "Orders", flow, object=True, port=port, num_workers=workers
+    )
+    print("stopped after", served, "invocations")

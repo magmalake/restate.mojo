@@ -134,19 +134,18 @@ curl localhost:8080/Orders/order-1/process --json '{}'
 
 ```
 --- attempt 1 at t+0s
-[attempt 1] execute  reserve  -> res-order-1-ef4aa2
-[attempt 1] execute  charge   -> boom: card declined (transient)
-  -> abandoned, Restate will retry: card declined
---- attempt 2 at t+60s
-[attempt 2] REPLAY   reserve  -> res-order-1-ef4aa2      <- not re-run
-[attempt 2] execute  charge   -> chg-order-1-62c63b
+[attempt 1] execute  reserve  -> res-order-1-b5f8d8
+[attempt 1] execute  charge   -> boom: card declined (retrying in-place)
+--- attempt 2 at t+0s
+[attempt 2] REPLAY   reserve  -> res-order-1-b5f8d8      <- not re-run
+[attempt 2] execute  charge   -> chg-order-1-fa3fcf
 [attempt 2] execute  ship     -> shipped
 ```
 
-It also shows the distinction people get wrong: `abandon` for a transient
-failure (retried, journal replayed) against `fail` for a terminal one (the
-caller gets the error, nothing is retried). Retries are about a minute apart,
-so a quiet terminal is the system working.
+It also shows the three ways to fail, which are not interchangeable:
+`run_fail(terminal=False)` re-runs the step, `run_fail(terminal=True)`
+journals the failure so the handler can compensate, and `app.fail` ends the
+invocation for good.
 
 ## Semantics you must respect
 

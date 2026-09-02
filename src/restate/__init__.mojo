@@ -515,8 +515,12 @@ struct App(Movable):
 
     def run_enter(self, inv: Invocation) raises -> Optional[String]:
         """Enter a journaled side-effect block. Returns the journaled value
-        on replay; None means: execute the side effect now, then call
-        `run_exit` with its result."""
+        on replay; None means: execute the side effect now, then close the
+        block with `run_exit` (it succeeded) or `run_fail` (it did not).
+
+        Exactly one of those must follow. Leaving the block open makes the
+        invocation unreplayable: every later attempt raises "protocol error:
+        expected rst_run_exit"."""
         var func = self.lib.get_function[Int]("rst_run_enter")
         var status = func(inv.handle)
         if status == STATUS_EXECUTE:
@@ -532,6 +536,35 @@ struct App(Movable):
         var status = func(inv.handle, Int(value_b.unsafe_ptr()), len(value_b))
         _ = value_b^
         self._check(status, "run_exit")
+        return _bytes_to_string(self._buf())
+
+    def run_fail(
+        self, inv: Invocation, message: String, terminal: Bool = True
+    ) raises -> Optional[String]:
+        """Abort the run block opened by `run_enter`, rather than closing it
+        with `run_exit`.
+
+        Every `run_enter` that returns None must be closed by exactly one of
+        `run_exit` or `run_fail`. Leaving one open makes the invocation
+        unreplayable: the next attempt raises "protocol error: expected
+        rst_run_exit" and keeps doing so forever.
+
+        `terminal=True` journals the failure. The step is recorded as failed,
+        replay reproduces the failure instead of executing again, and this
+        raises so the handler can compensate and finish.
+
+        `terminal=False` journals nothing and lets Restate re-run the block
+        under its own retry policy. The return value is then the next
+        execute slot: `None` means "run the side effect again", and a value
+        means the journal answered in the meantime.
+        """
+        var message_c = _cstr(message)
+        var func = self.lib.get_function[Int]("rst_run_fail")
+        var status = func(inv.handle, Int(message_c.unsafe_ptr()), 1 if terminal else 0)
+        _ = message_c^
+        if status == STATUS_EXECUTE:
+            return None
+        self._check(status, "run_fail")
         return _bytes_to_string(self._buf())
 
     # ── finishing an invocation ────────────────────────────────────────────

@@ -538,6 +538,41 @@ struct App(Movable):
         self._check(status, "run_exit")
         return _bytes_to_string(self._buf())
 
+    def run_enter_policy(
+        self,
+        inv: Invocation,
+        initial_delay_ms: Int = 0,
+        factor: Float64 = 0.0,
+        max_delay_ms: Int = 0,
+        max_attempts: Int = 0,
+        max_duration_ms: Int = 0,
+    ) raises -> Optional[String]:
+        """`run_enter`, with a retry policy for this block's non-terminal
+        failures.
+
+        Plain `run_enter` leaves retries to Restate's server-side invoker
+        policy, which retries indefinitely. Set any of these to bound it; 0
+        means "leave that knob alone", and `max_attempts` or `max_duration_ms`
+        of 0 mean unbounded.
+
+        When attempts or duration run out the SDK fails the block terminally,
+        which arrives here the same way `run_fail(terminal=True)` does — as a
+        raised error the handler can compensate for.
+        """
+        var func = self.lib.get_function[Int]("rst_run_enter_policy")
+        var status = func(
+            inv.handle,
+            initial_delay_ms,
+            Float32(factor),
+            max_delay_ms,
+            max_attempts,
+            max_duration_ms,
+        )
+        if status == STATUS_EXECUTE:
+            return None
+        self._check(status, "run_enter_policy")
+        return _bytes_to_string(self._buf())
+
     def run_fail(
         self, inv: Invocation, message: String, terminal: Bool = True
     ) raises -> Optional[String]:

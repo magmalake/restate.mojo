@@ -29,6 +29,30 @@ Real output, with `--fail 2`:
 timestamp, so a second execution could not have produced the same string —
 that it is identical is the journal, not luck.
 
+## Bounding the retries
+
+Plain `run_enter` leaves retries to Restate's invoker policy, which keeps
+going indefinitely. `run_enter_policy` bounds them — `notify` allows three
+attempts a quarter-second apart, then the SDK fails the block terminally and
+the handler carries on without the notification:
+
+    --- notify attempt 5
+    [attempt 5] execute  notify   -> smtp timeout
+    --- notify attempt 6
+    [attempt 6] execute  notify   -> smtp timeout
+    --- notify attempt 7
+    [attempt 7] execute  notify   -> smtp timeout
+      gave up after 3 tries: Terminal error [500]: smtp timeout
+
+Right for a courtesy email; wrong for a payment, which is why it is not the
+default.
+
+**A suspension is not a failure.** Between attempts the invocation can be
+parked waiting on a durable timer, and that arrives as an exception too. Catch
+it as if the step had failed and you will compensate for work that was still
+in progress — `refund` and `notify` both re-raise it via `is_suspended` so the
+outer handler abandons and Restate resumes.
+
 ## Three ways to fail, and they are not interchangeable
 
 - **`run_fail(inv, msg, terminal=False)`** — the step failed, try it again.
@@ -55,6 +79,7 @@ every later attempt died with "protocol error: expected rst_run_exit".
 
     process    the three-step flow above
     refund     a step that fails terminally, and compensation
+    notify     bounded retries: three attempts, then give up and carry on
     validate   terminal invocation failure on bad input, never retried
     status     what the object recorded, so you can watch state survive
     arm        re-arm the flaky charge and run the demo again
@@ -133,6 +158,25 @@ def _step_charge(
         return app.run_exit(inv, value)
 
 
+def _step_notify(app: App, inv: Invocation, attempt: Int) raises -> String:
+    """A step that is allowed to give up.
+
+    Plain `run_enter` leaves retries to Restate's invoker policy, which keeps
+    going indefinitely — right for a payment, wrong for a courtesy email
+    nobody is waiting on. Three attempts a quarter-second apart, then the SDK
+    fails the block terminally and the handler moves on.
+    """
+    var slot = app.run_enter_policy(
+        inv, initial_delay_ms=250, max_attempts=3
+    )
+    while True:
+        if slot:
+            print("[attempt ", attempt, "] REPLAY   notify   -> ", slot.value(), sep="")
+            return slot.value()
+        print("[attempt ", attempt, "] execute  notify   -> smtp timeout", sep="")
+        slot = app.run_fail(inv, String("smtp timeout"), terminal=False)
+
+
 def _step_refund(app: App, inv: Invocation, attempt: Int) raises -> String:
     """A step that fails for good.
 
@@ -177,7 +221,7 @@ def main() raises:
 
     var app = App(
         "Orders",
-        ["process", "refund", "validate", "status", "arm"],
+        ["process", "refund", "notify", "validate", "status", "arm"],
         object=True,
         port=port,
     )
@@ -227,9 +271,27 @@ def main() raises:
                     var receipt = _step_refund(app, inv, attempt)
                     app.complete(inv, receipt)
                 except e:
+                    # A suspension is not a failure: the invocation is parked
+                    # waiting on something durable and will be resumed. Catch
+                    # it as if the step had failed and you compensate for work
+                    # that was still in progress.
+                    if is_suspended(e):
+                        raise e
                     print("  compensating: ", e, sep="")
                     app.set_state(inv, "refund", String("failed: ", e))
                     app.complete(inv, String("refund failed, credit note issued"))
+
+            elif inv.handler == "notify":
+                # Bounded retries: three tries, then give up and carry on.
+                attempt += 1
+                print("--- notify attempt ", attempt, sep="")
+                try:
+                    app.complete(inv, _step_notify(app, inv, attempt))
+                except e:
+                    if is_suspended(e):
+                        raise e
+                    print("  gave up after 3 tries: ", e, sep="")
+                    app.complete(inv, String("order placed, notification skipped"))
 
             elif inv.handler == "validate":
                 # Terminal: a malformed order will not become well-formed by

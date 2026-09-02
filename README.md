@@ -142,7 +142,9 @@ curl localhost:8080/Orders/order-1/process --json '{}'
 [attempt 2] execute  ship     -> shipped
 ```
 
-It also shows the three ways to fail, which are not interchangeable:
+It also shows how to bound retries with `run_enter_policy` — three attempts
+then give up, rather than Restate's indefinite default — and the three ways to
+fail, which are not interchangeable:
 `run_fail(terminal=False)` re-runs the step, `run_fail(terminal=True)`
 journals the failure so the handler can compensate, and `app.fail` ends the
 invocation for good.

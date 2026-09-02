@@ -120,6 +120,34 @@ Service flavors: `App(..., object=True)` (default) is a Virtual Object;
 handler named `run` executes once per key while the other handlers are
 shared (use promises to signal between them).
 
+## Failures, and what replay actually skips
+
+`examples/failures.mojo` is the one to run if you want to see why any of this
+is worth the trouble: a three-step order flow whose middle step fails, so you
+can watch the completed steps *not* run again on the retry.
+
+```sh
+pixi run failures                                   # terminal 1
+restate deployments register http://localhost:9080  # terminal 2
+curl localhost:8080/Orders/order-1/process --json '{}'
+```
+
+```
+--- attempt 1 at t+0s
+[attempt 1] execute  reserve  -> res-order-1-ef4aa2
+[attempt 1] execute  charge   -> boom: card declined (transient)
+  -> abandoned, Restate will retry: card declined
+--- attempt 2 at t+60s
+[attempt 2] REPLAY   reserve  -> res-order-1-ef4aa2      <- not re-run
+[attempt 2] execute  charge   -> chg-order-1-62c63b
+[attempt 2] execute  ship     -> shipped
+```
+
+It also shows the distinction people get wrong: `abandon` for a transient
+failure (retried, journal replayed) against `fail` for a terminal one (the
+caller gets the error, nothing is retried). Retries are about a minute apart,
+so a quiet terminal is the system working.
+
 ## Semantics you must respect
 
 - **Determinism between ctx ops.** On retries/resumes Restate re-runs your

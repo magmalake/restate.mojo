@@ -25,6 +25,7 @@ threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "d05cb
 counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
 build-example = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter"
 chain = "mkdir -p build && mojo build examples/chain.mojo -I src -o build/chain && ./build/chain"
+failures = "mkdir -p build && mojo build examples/failures.mojo -I src -o build/failures && ./build/failures"
 # End-to-end gate: boots a throwaway restate-server via npx, registers the
 # counter endpoint, and asserts state/sleep/run behavior.
 it = "bash test/integration.sh"

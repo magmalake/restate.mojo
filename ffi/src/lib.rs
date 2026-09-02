@@ -43,6 +43,20 @@
 //! Payloads are raw bytes end to end (Vec<u8> implements the SDK serde).
 
 use futures::future::BoxFuture;
+
+/// A non-terminal error, so `HandlerError` classifies it as retryable and the
+/// SDK re-runs the `ctx.run` closure rather than journaling a failure.
+#[derive(Debug)]
+struct RunRetry(String);
+
+impl std::fmt::Display for RunRetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RunRetry {}
+
 use restate_sdk::context::RequestTarget;
 use restate_sdk::discovery;
 use restate_sdk::endpoint::{ContextInternal, Endpoint};
@@ -81,6 +95,8 @@ enum Cmd {
     Send { target: RequestTarget, payload: Vec<u8>, delay_ms: u64 },
     RunEnter,
     RunExit(Vec<u8>),
+    /// Abort the open run block: (message, terminal?).
+    RunFail(String, bool),
     AwakeableCreate,
     AwakeableAwait(String),
     AwakeableResolve(String, Vec<u8>),
@@ -268,6 +284,18 @@ impl Service for DynamicService {
                                 let _ = rtx.send(Reply::RunExecute);
                                 match crx.recv().await {
                                     Some(Cmd::RunExit(bytes)) => Ok(bytes),
+                                    // A terminal failure is journaled: replay
+                                    // reproduces it instead of running again.
+                                    Some(Cmd::RunFail(msg, true)) => {
+                                        Err(HandlerError::from(TerminalError::new(msg)))
+                                    }
+                                    // A retryable failure is not journaled. The
+                                    // SDK re-runs this closure under its own
+                                    // retry policy, which sends another
+                                    // RunExecute to the Mojo side.
+                                    Some(Cmd::RunFail(msg, false)) => {
+                                        Err(HandlerError::from(RunRetry(msg)))
+                                    }
                                     _ => Err(HandlerError::from(TerminalError::new(
                                         "restate.mojo protocol error: expected rst_run_exit",
                                     ))),
@@ -283,6 +311,12 @@ impl Service for DynamicService {
                         // rst_run_exit without rst_run_enter — protocol error.
                         let _ = reply_tx.send(Reply::Terminal(
                             "restate.mojo protocol error: rst_run_exit without rst_run_enter"
+                                .into(),
+                        ));
+                    }
+                    Cmd::RunFail(_, _) => {
+                        let _ = reply_tx.send(Reply::Terminal(
+                            "restate.mojo protocol error: rst_run_fail without rst_run_enter"
                                 .into(),
                         ));
                     }
@@ -859,6 +893,23 @@ pub extern "C" fn rst_run_enter(handle: u64) -> i32 {
 pub extern "C" fn rst_run_exit(handle: u64, value: *const u8, value_len: usize) -> i32 {
     let value = unsafe { bytes(value, value_len) };
     simple_op(handle, Cmd::RunExit(value))
+}
+
+/// Abort the run block opened by rst_run_enter, instead of completing it with
+/// rst_run_exit.
+///
+/// `terminal != 0` journals the failure: the step is recorded as failed and a
+/// replay reproduces it rather than executing again. `terminal == 0` leaves
+/// nothing in the journal and lets the SDK re-run the block under its retry
+/// policy, which surfaces here as another STATUS_EXECUTE.
+///
+/// Without this, a handler that hits an error between rst_run_enter and
+/// rst_run_exit has no way to close the block, and every later attempt fails
+/// with "expected rst_run_exit".
+#[no_mangle]
+pub extern "C" fn rst_run_fail(handle: u64, message: *const c_char, terminal: i32) -> i32 {
+    let msg = unsafe { cstr(message) }.unwrap_or_else(|_| "run failed".into());
+    simple_op(handle, Cmd::RunFail(msg, terminal != 0))
 }
 
 /// Complete the invocation successfully with the given output bytes.

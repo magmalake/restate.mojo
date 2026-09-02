@@ -1,9 +1,8 @@
 """Failures — what durable execution actually buys you.
 
-A three-step order flow where the middle step fails. Run it, invoke it, and
-watch the log: the steps that already succeeded do **not** run again when
-Restate retries. That is the whole idea, and it is much easier to believe from
-a terminal than from a paragraph.
+A three-step order flow whose middle step fails, so you can watch the steps
+that already succeeded *not* run again. That is the whole idea, and it is much
+easier to believe from a terminal than from a paragraph.
 
     pixi run failures                                   # terminal 1
     restate deployments register http://localhost:9080  # terminal 2
@@ -12,20 +11,17 @@ a terminal than from a paragraph.
 The `--json` matters: a bare POST is rejected by the ingress with
 "Empty content-type" before it ever reaches your handler.
 
-The flow reserves stock, charges a card, then ships. `charge` throws the first
-time it is reached. Real output, `--fail 2` so replay happens twice:
+Real output, with `--fail 2`:
 
     --- attempt 1 at t+0s
-    [attempt 1] execute  reserve  -> res-order-1-108461
-    [attempt 1] execute  charge   -> boom: card declined (transient)
-      -> abandoned, Restate will retry: card declined
-    --- attempt 2 at t+60s
-    [attempt 2] REPLAY   reserve  -> res-order-1-108461
-    [attempt 2] execute  charge   -> boom: card declined (transient)
-      -> abandoned, Restate will retry: card declined
-    --- attempt 3 at t+121s
-    [attempt 3] REPLAY   reserve  -> res-order-1-108461
-    [attempt 3] execute  charge   -> chg-order-1-8cca1c
+    [attempt 1] execute  reserve  -> res-order-1-c4ea8c
+    [attempt 1] execute  charge   -> boom: card declined (retrying in-place)
+    --- attempt 2 at t+0s
+    [attempt 2] REPLAY   reserve  -> res-order-1-c4ea8c
+    [attempt 2] execute  charge   -> boom: card declined (retrying in-place)
+    --- attempt 3 at t+2s
+    [attempt 3] REPLAY   reserve  -> res-order-1-c4ea8c
+    [attempt 3] execute  charge   -> chg-order-1-b40aa
     [attempt 3] execute  ship     -> shipped
     [attempt 3] done
 
@@ -33,39 +29,33 @@ time it is reached. Real output, `--fail 2` so replay happens twice:
 timestamp, so a second execution could not have produced the same string —
 that it is identical is the journal, not luck.
 
-**Retries are about a minute apart** (t+0, t+60, t+121 above). Nothing is
-wrong if the terminal sits quiet; that is Restate's re-delivery interval, and
-it is why `--fail` defaults to 1.
+## Three ways to fail, and they are not interchangeable
 
-## Transient vs terminal
+- **`run_fail(inv, msg, terminal=False)`** — the step failed, try it again.
+  Nothing is journaled and Restate re-runs the block. `charge` uses this.
+- **`run_fail(inv, msg, terminal=True)`** — the step failed for good. The
+  failure is journaled and raised so the handler can compensate and finish.
+  `refund` uses this.
+- **`app.fail(inv, msg)`** — the whole invocation is a lost cause. The caller
+  gets the error, nothing is retried. `validate` uses this on malformed input,
+  which will not become well-formed by trying again.
 
-Two ways for a handler to end badly, and the difference is the thing people
-get wrong:
+Every `run_enter` that returns None must be closed by exactly one of
+`run_exit` or `run_fail`. Leaving one open used to be the only thing you could
+do when a side effect failed, and it made the invocation unreplayable —
+every later attempt died with "protocol error: expected rst_run_exit".
 
-- **`app.abandon(inv)`** — transient. Restate re-delivers the invocation and
-  replays the journal. `charge` uses this.
-- **`app.fail(inv, msg)`** — terminal. The caller gets the error, nothing is
-  retried. `validate` uses this: a malformed order will not become
-  well-formed by trying again.
-
-Abandoning a permanently broken invocation retries it forever; failing a
-transient one throws away work that would have succeeded on the next attempt.
-
-    curl localhost:8080/Orders/order-2/validate --json '"12 widgets"'
-    accepted: "12 widgets"
+    curl localhost:8080/Orders/order-3/refund --json '{}'
+    refund failed, credit note issued
 
     curl localhost:8080/Orders/order-2/validate --json '""'
     {"code":500,"message":"order is empty","source":"invocation"}
 
-## Where the journal boundary goes
-
-`charge` makes its fallible call *before* `run_enter`, and that ordering is
-forced rather than stylistic — see the comment on `_step_charge`.
-
 ## Handlers
 
     process    the three-step flow above
-    validate   terminal failure on bad input, never retried
+    refund     a step that fails terminally, and compensation
+    validate   terminal invocation failure on bad input, never retried
     status     what the object recorded, so you can watch state survive
     arm        re-arm the flaky charge and run the demo again
 
@@ -111,37 +101,54 @@ def _step_reserve(app: App, inv: Invocation, attempt: Int) raises -> String:
 def _step_charge(
     app: App, inv: Invocation, attempt: Int, mut failures_left: Int
 ) raises -> String:
-    """The flaky step — and the one that shows where the journal boundary is.
+    """The flaky step, with the fallible call *inside* the journal block.
 
-    The call that can fail happens **before** `run_enter`. That ordering is
-    forced: once `run_enter` hands you an execute slot, the journal expects a
-    matching `run_exit`, and abandoning in between leaves the invocation
-    unreplayable —
+    `run_fail(terminal=False)` closes the block without journaling anything
+    and lets Restate re-run it under the SDK's own retry policy — which comes
+    back as another execute slot, hence the loop. Earlier steps are untouched
+    because the handler never returns.
 
-        restate.mojo protocol error: expected rst_run_exit
-
-    So the rule with this API is: make the fallible call, and journal its
-    result only once you have one. The cost is that a crash *between* a
-    successful charge and `run_exit` would charge twice on retry; a
-    `ctx.run` that could itself be failed would close that window, which this
-    binding does not expose yet.
+    Before `run_fail` existed this shape was impossible: raising between
+    `run_enter` and `run_exit` left the block open and every later attempt
+    died with "protocol error: expected rst_run_exit".
     """
-    if failures_left > 0:
-        failures_left -= 1
-        print(
-            "[attempt ", attempt,
-            "] execute  charge   -> boom: card declined (transient)", sep="",
-        )
-        raise Error("card declined")
+    var slot = app.run_enter(inv)
+    while True:
+        if slot:
+            print("[attempt ", attempt, "] REPLAY   charge   -> ", slot.value(), sep="")
+            return slot.value()
 
-    var replayed = app.run_enter(inv)
-    if replayed:
-        print("[attempt ", attempt, "] REPLAY   charge   -> ", replayed.value(), sep="")
-        return replayed.value()
+        if failures_left > 0:
+            failures_left -= 1
+            print(
+                "[attempt ", attempt,
+                "] execute  charge   -> boom: card declined (retrying in-place)",
+                sep="",
+            )
+            slot = app.run_fail(inv, String("card declined"), terminal=False)
+            continue
 
-    var value = _short_id("chg", inv.key)
-    print("[attempt ", attempt, "] execute  charge   -> ", value, sep="")
-    return app.run_exit(inv, value)
+        var value = _short_id("chg", inv.key)
+        print("[attempt ", attempt, "] execute  charge   -> ", value, sep="")
+        return app.run_exit(inv, value)
+
+
+def _step_refund(app: App, inv: Invocation, attempt: Int) raises -> String:
+    """A step that fails for good.
+
+    `run_fail(terminal=True)` journals the failure and raises it, so the
+    handler can compensate and finish. The contrast with `_step_charge` is the
+    whole point: a non-terminal failure re-runs the block, a terminal one ends
+    it, and choosing wrong means either retrying a dead endpoint forever or
+    giving up on a blip.
+    """
+    var slot = app.run_enter(inv)
+    if slot:
+        print("[attempt ", attempt, "] REPLAY   refund   -> ", slot.value(), sep="")
+        return slot.value()
+    print("[attempt ", attempt, "] execute  refund   -> gateway says no, permanently", sep="")
+    _ = app.run_fail(inv, String("refund rejected: account closed"), terminal=True)
+    raise Error("unreachable: run_fail(terminal=True) raises")
 
 
 def _step_ship(app: App, inv: Invocation, attempt: Int) raises -> String:
@@ -170,7 +177,7 @@ def main() raises:
 
     var app = App(
         "Orders",
-        ["process", "validate", "status", "arm"],
+        ["process", "refund", "validate", "status", "arm"],
         object=True,
         port=port,
     )
@@ -206,6 +213,23 @@ def main() raises:
                 print("[attempt ", attempt, "] done", sep="")
                 print()
                 app.complete(inv, String(reserved, " / ", charged, " / ", shipped))
+
+            elif inv.handler == "refund":
+                # The other half of run_fail: a step that fails for good.
+                # The failure is journaled and raised here, so the handler
+                # compensates once and completes — rather than retrying a
+                # dead gateway forever, which is what a non-terminal failure
+                # would do. Invoke it twice and it executes twice: a second
+                # invocation has its own journal; replay is within one.
+                attempt += 1
+                print("--- refund attempt ", attempt, sep="")
+                try:
+                    var receipt = _step_refund(app, inv, attempt)
+                    app.complete(inv, receipt)
+                except e:
+                    print("  compensating: ", e, sep="")
+                    app.set_state(inv, "refund", String("failed: ", e))
+                    app.complete(inv, String("refund failed, credit note issued"))
 
             elif inv.handler == "validate":
                 # Terminal: a malformed order will not become well-formed by

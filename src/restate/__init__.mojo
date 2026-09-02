@@ -7,20 +7,8 @@ business logic, driven by a synchronous loop:
     from restate import App
 
     def main() raises:
-        var app = App("Counter", ["add", "get"], object=True)
-        while True:
-            var inv = app.next()
-            try:
-                if inv.handler == "add":
-                    var n = app.get_state_int(inv, "count", 0) + 1
-                    app.set_state_int(inv, "count", n)
-                    app.complete(inv, String(n))
-                elif inv.handler == "get":
-                    app.complete(inv, String(app.get_state_int(inv, "count", 0)))
-            except e:
-                app.abandon(inv)
-                if not is_suspended(e):
-                    raise e
+        var stats = Stats(0)
+        _ = App.run[Stats, __functions_in_module()]("Counter", stats)
 
 That loop is single-threaded, and a handler that `call`s another handler served
 by the same process therefore deadlocks. `App.serve` is the concurrent form —
@@ -55,6 +43,7 @@ from std.memory import alloc
 from std.sys.info import CompilationTarget
 from std.ffi import OwnedDLHandle, c_char
 from std.os import getenv
+from std.reflection import get_function_name
 
 from threads import (
     AtomicCounter,
@@ -228,7 +217,7 @@ struct App(Movable):
             )
         raise Error("restate " + what + " failed: " + self._last_error())
 
-    def next(self) raises -> Invocation:
+    def _next(self) raises -> Invocation:
         """Block until Restate delivers the next invocation.
 
         Safe to call from several threads at once — the shim's job receiver is
@@ -538,6 +527,41 @@ struct App(Movable):
         self._check(status, "run_exit")
         return _bytes_to_string(self._buf())
 
+    def run_enter_policy(
+        self,
+        inv: Invocation,
+        initial_delay_ms: Int = 0,
+        factor: Float64 = 0.0,
+        max_delay_ms: Int = 0,
+        max_attempts: Int = 0,
+        max_duration_ms: Int = 0,
+    ) raises -> Optional[String]:
+        """`run_enter`, with a retry policy for this block's non-terminal
+        failures.
+
+        Plain `run_enter` leaves retries to Restate's server-side invoker
+        policy, which retries indefinitely. Set any of these to bound it; 0
+        means "leave that knob alone", and `max_attempts` or `max_duration_ms`
+        of 0 mean unbounded.
+
+        When attempts or duration run out the SDK fails the block terminally,
+        which arrives here the same way `run_fail(terminal=True)` does — as a
+        raised error the handler can compensate for.
+        """
+        var func = self.lib.get_function[Int]("rst_run_enter_policy")
+        var status = func(
+            inv.handle,
+            initial_delay_ms,
+            Float32(factor),
+            max_delay_ms,
+            max_attempts,
+            max_duration_ms,
+        )
+        if status == STATUS_EXECUTE:
+            return None
+        self._check(status, "run_enter_policy")
+        return _bytes_to_string(self._buf())
+
     def run_fail(
         self, inv: Invocation, message: String, terminal: Bool = True
     ) raises -> Optional[String]:
@@ -623,6 +647,84 @@ struct App(Movable):
 
     # ── served mode ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def run[
+        T: AnyType, funcs: Tuple, /
+    ](
+        service: String,
+        ref state: T,
+        object: Bool = True,
+        workflow: Bool = False,
+        host: String = "0.0.0.0",
+        port: Int = 9080,
+        num_workers: Int = 0,
+    ) raises -> Int:
+        """Discover the module's handlers, serve them, and block until stopped.
+
+        The whole driver:
+
+            @fieldwise_init
+            struct Stats(Copyable, Movable):
+                var seen: Int64
+
+            def handle_add(app: App, inv: Invocation, w: Int, ctx: Ctx[Stats]) raises:
+                app.complete(inv, String("ok"))
+
+            def main() raises:
+                var stats = Stats(0)
+                _ = App.run[Stats, __functions_in_module()]("Counter", stats)
+
+        Every `handle_*` in the calling module is registered under its name
+        without the prefix and dispatched to by that name. There is no list to
+        keep in step with the handlers, because there is no list.
+
+        Pass `__functions_in_module()` for `funcs`. `state` is process-local
+        and shared by every worker — see `Ctx`.
+
+        Returns how many invocations completed without raising.
+        """
+        var names = List[String]()
+        _handler_names[funcs](names)
+        if len(names) == 0:
+            raise Error(
+                "restate: no handlers found — name them handle_<something> in"
+                " the module you pass __functions_in_module() from"
+            )
+        var app = App(
+            service,
+            names,
+            object=object,
+            workflow=workflow,
+            host=host,
+            port=port,
+        )
+        return app.serve_with[T, _dispatch[T, funcs]](
+            state, num_workers=num_workers
+        )
+
+    def serve_with[
+        T: AnyType,
+        handler: def(App, Invocation, Int, Ctx[T]) thin raises -> None,
+    ](
+        self,
+        ref state: T,
+        num_workers: Int = 0,
+    ) raises -> Int:
+        """`serve`, with the process-local state carried as a typed `Ctx[T]`.
+
+        The same driver; the only difference is that the handler receives
+        `Ctx[T]` instead of a raw `OpaquePtr`, so it can say `ctx[].field`
+        rather than computing offsets. `state` must outlive the call, which it
+        does: `serve` joins every worker before returning.
+
+        Prefer this over `serve`. The untyped form remains for handlers whose
+        state is genuinely not a single struct.
+        """
+
+        return self.serve[_typed_handler[T, handler]](
+            num_workers=num_workers, ctx=Ctx[T].to(state).opaque()
+        )
+
     def serve[
         handler: HandlerFn
     ](
@@ -705,6 +807,63 @@ struct App(Movable):
 # ── served mode: the handler contract and its plumbing ──────────────────────
 
 
+@fieldwise_init
+struct Unit(Copyable, Movable):
+    """No process-local state.
+
+    A service that keeps everything in Restate state still has to name a type
+    for `Ctx`. `Unit` is that type, and saying it out loud is worth more than
+    it costs: it tells a reader the handlers share nothing across invocations.
+    """
+
+    pass
+
+
+@fieldwise_init
+struct Ctx[T: AnyType](Copyable, Movable):
+    """A typed view of the process-local state `serve` hands to each handler.
+
+    Handlers must be thin, so state cannot be captured — it travels through a
+    pointer instead. `Ctx` is that pointer with its type still attached, so a
+    handler writes `ctx[].live` rather than reckoning byte offsets into an
+    untyped block.
+
+    **It does not make the state safe to share.** Every worker thread gets the
+    same `T`, concurrently. Fields that more than one handler touches have to
+    be atomics, exactly as they would through a raw pointer.
+
+    When Mojo can carry captures across a thread boundary this whole parameter
+    disappears from the signature and the state is simply captured; the body
+    keeps working with `ctx[].x` renamed to `x`.
+    """
+
+    var _ptr: UnsafePointer[Self.T, MutUntrackedOrigin]
+
+    @staticmethod
+    def to(ref state: Self.T) -> Self:
+        """A `Ctx` over `state`, which must outlive the `serve` call."""
+        return Self(
+            UnsafePointer[Self.T, MutUntrackedOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=state))
+            )
+        )
+
+    @staticmethod
+    def from_opaque(ptr: OpaquePtr) -> Self:
+        """Rebuild the typed view inside a worker, from what `serve` passed."""
+        return Self(
+            UnsafePointer[Self.T, MutUntrackedOrigin](
+                unsafe_from_address=Int(ptr)
+            )
+        )
+
+    def __getitem__(self) -> ref [MutUntrackedOrigin] Self.T:
+        return self._ptr[]
+
+    def opaque(self) -> OpaquePtr:
+        return opaque_ptr(Int(self._ptr))
+
+
 comptime HandlerFn = def(App, Invocation, Int, OpaquePtr) thin raises -> None
 """What `App.serve` runs for each invocation: `(app, inv, worker, ctx)`.
 
@@ -725,6 +884,69 @@ Restate waiting.
 
 
 # Worker context layout for `serve`, in 64-bit cells.
+def _typed_handler[
+    T: AnyType,
+    handler: def(App, Invocation, Int, Ctx[T]) thin raises -> None,
+](app: App, inv: Invocation, worker: Int, ctx: OpaquePtr) raises -> None:
+    """Adapts a `Ctx[T]` handler to the untyped `HandlerFn` the pool needs."""
+    handler(app, inv, worker, Ctx[T].from_opaque(ctx))
+
+
+
+# ── comptime handler discovery ──────────────────────────────────────────────
+#
+# A service used to declare its handlers twice: once as a list passed to `App`,
+# and again as an if-chain on `inv.handler`. Nothing kept the two in step, and
+# a handler present in one and missing from the other fails at runtime, on the
+# first request that reaches it.
+#
+# `comptime` removes the second copy. Both the registration list and the
+# dispatch are derived from the same `handle_*` functions in the module, so
+# they cannot disagree.
+
+comptime _HANDLER_PREFIX = "handle_"
+
+
+def _handler_names[funcs: Tuple, /](mut out: List[String]) raises:
+    """Every `handle_*` in the module, minus the prefix — the names Restate
+    registers, and the names invocations arrive under."""
+    comptime for i in range(len(funcs)):
+        comptime f = funcs[i]
+
+        comptime if get_function_name[f]().startswith(_HANDLER_PREFIX):
+            out.append(String(get_function_name[f]()[byte = _HANDLER_PREFIX.byte_length() :]))
+
+
+def _invoke[
+    T: AnyType,
+    f: def (App, Invocation, Int, Ctx[T]) thin raises -> None,
+](app: App, inv: Invocation, worker: Int, ctx: Ctx[T]) raises -> None:
+    f(app, inv, worker, ctx)
+
+
+def _dispatch[
+    T: AnyType, funcs: Tuple, /
+](app: App, inv: Invocation, worker: Int, ctx: Ctx[T]) raises -> None:
+    """Route one invocation to the `handle_*` function whose name matches.
+
+    An unknown handler is a terminal failure, not a retry: Restate only sends
+    what discovery advertised, so an unknown name means the two have drifted
+    and no amount of retrying will fix it.
+    """
+    comptime for i in range(len(funcs)):
+        comptime f = funcs[i]
+
+        comptime if get_function_name[f]().startswith(_HANDLER_PREFIX):
+            if inv.handler == String(
+                get_function_name[f]()[byte = _HANDLER_PREFIX.byte_length() :]
+            ):
+                _invoke[T, rebind[
+                    def (App, Invocation, Int, Ctx[T]) thin raises -> None
+                ](f)](app, inv, worker, ctx)
+                return
+    app.fail(inv, String("unknown handler: ", inv.handler))
+
+
 comptime _SERVE_APP: Int = 0
 """Address of the caller's `App` — borrowed, never copied."""
 comptime _SERVE_USER: Int = 1
@@ -778,7 +1000,7 @@ def _serve_worker[
     var errors = AtomicCounter.at(Int(ctx) + _SERVE_ERRORS * 8)
     while not stop.is_set():
         try:
-            var inv = app[].next()
+            var inv = app[]._next()
             _serve_one[handler](app[], inv^, worker, user_ctx, served, errors)
         except:
             # `next()` raised: either `stop()` was called, or the endpoint

@@ -11,10 +11,10 @@ WORK="$(mktemp -d /tmp/restate-mojo-it.XXXXXX)"
 # Ports, overridable: a developer machine often already has a Restate stack on
 # 8080/9070 and a service on 9080, and registering against *that* server
 # silently tests somebody else's deployment.
-INGRESS="${RESTATE_IT_INGRESS:-8080}"
-ADMIN="${RESTATE_IT_ADMIN:-9070}"
-NODE="${RESTATE_IT_NODE:-5122}"
-ENDPOINT="${RESTATE_IT_ENDPOINT:-9080}"
+INGRESS="${RESTATE_IT_INGRESS:-18081}"
+ADMIN="${RESTATE_IT_ADMIN:-19071}"
+NODE="${RESTATE_IT_NODE:-15123}"
+ENDPOINT="${RESTATE_IT_ENDPOINT:-19081}"
 CLEANUP() {
     kill "${COUNTER_PID:-0}" "${SERVER_PID:-0}" 2>/dev/null || true
     wait 2>/dev/null || true

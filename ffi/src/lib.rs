@@ -57,7 +57,7 @@ impl std::fmt::Display for RunRetry {
 
 impl std::error::Error for RunRetry {}
 
-use restate_sdk::context::RequestTarget;
+use restate_sdk::context::{RequestTarget, RunFuture, RunRetryPolicy};
 use restate_sdk::discovery;
 use restate_sdk::endpoint::{ContextInternal, Endpoint};
 use restate_sdk::errors::{HandlerError, TerminalError};
@@ -93,7 +93,7 @@ enum Cmd {
     ClearState(String),
     Call { target: RequestTarget, payload: Vec<u8> },
     Send { target: RequestTarget, payload: Vec<u8>, delay_ms: u64 },
-    RunEnter,
+    RunEnter(Option<RunRetryPolicy>),
     RunExit(Vec<u8>),
     /// Abort the open run block: (message, terminal?).
     RunFail(String, bool),
@@ -276,10 +276,10 @@ impl Service for DynamicService {
                         let _ = ctx.send(target, None, None, None, vec![], payload, delay);
                         let _ = reply_tx.send(Reply::Ok(Vec::new()));
                     }
-                    Cmd::RunEnter => {
+                    Cmd::RunEnter(policy) => {
                         let rtx = reply_tx.clone();
                         let crx = &mut cmd_rx;
-                        let r = ctx
+                        let fut = ctx
                             .run(move || async move {
                                 let _ = rtx.send(Reply::RunExecute);
                                 match crx.recv().await {
@@ -300,8 +300,11 @@ impl Service for DynamicService {
                                         "restate.mojo protocol error: expected rst_run_exit",
                                     ))),
                                 }
-                            })
-                            .await;
+                            });
+                        let r = match policy {
+                            Some(p) => fut.retry_policy(p).await,
+                            None => fut.await,
+                        };
                         let _ = reply_tx.send(match r {
                             Ok(v) => Reply::Ok(v),
                             Err(te) => Reply::Terminal(te.to_string()),
@@ -884,7 +887,7 @@ pub extern "C" fn rst_cancel_invocation(handle: u64, invocation_id: *const c_cha
 /// side effect, then call rst_run_exit with its result.
 #[no_mangle]
 pub extern "C" fn rst_run_enter(handle: u64) -> i32 {
-    simple_op(handle, Cmd::RunEnter)
+    simple_op(handle, Cmd::RunEnter(None))
 }
 
 /// Provide the side-effect result; it is journaled and echoed back in
@@ -893,6 +896,38 @@ pub extern "C" fn rst_run_enter(handle: u64) -> i32 {
 pub extern "C" fn rst_run_exit(handle: u64, value: *const u8, value_len: usize) -> i32 {
     let value = unsafe { bytes(value, value_len) };
     simple_op(handle, Cmd::RunExit(value))
+}
+
+/// Enter a run block with an explicit retry policy for the non-terminal
+/// failures reported through rst_run_fail. A zero or negative value means
+/// "leave this knob at the SDK default"; max_attempts/max_duration_ms of 0
+/// mean unbounded.
+#[no_mangle]
+pub extern "C" fn rst_run_enter_policy(
+    handle: u64,
+    initial_delay_ms: u64,
+    factor: f32,
+    max_delay_ms: u64,
+    max_attempts: u32,
+    max_duration_ms: u64,
+) -> i32 {
+    let mut p = RunRetryPolicy::new();
+    if initial_delay_ms > 0 {
+        p = p.initial_delay(Duration::from_millis(initial_delay_ms));
+    }
+    if factor > 0.0 {
+        p = p.exponentiation_factor(factor);
+    }
+    if max_delay_ms > 0 {
+        p = p.max_delay(Duration::from_millis(max_delay_ms));
+    }
+    if max_attempts > 0 {
+        p = p.max_attempts(max_attempts);
+    }
+    if max_duration_ms > 0 {
+        p = p.max_duration(Duration::from_millis(max_duration_ms));
+    }
+    simple_op(handle, Cmd::RunEnter(Some(p)))
 }
 
 /// Abort the run block opened by rst_run_enter, instead of completing it with

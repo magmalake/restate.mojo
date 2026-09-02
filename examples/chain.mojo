@@ -27,17 +27,29 @@ from std.memory import alloc
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from restate import App, Invocation
+from restate import App, Ctx, Invocation
 from threads import AtomicCounter, OpaquePtr, i64_ptr, num_cpus, opaque_ptr
 
 
-# Process-local state, in 64-bit cells: shared by every handler invocation on
-# every worker, and reached through the `ctx` pointer `serve` hands along.
-comptime C_LIVE: Int = 0
-"""How many `hold` invocations are executing right now."""
-comptime C_PEAK: Int = 1
-"""The most that were ever executing at once."""
-comptime C_CELLS: Int = 2
+@fieldwise_init
+struct Stats(Copyable, Movable):
+    """Process-local state, shared by every handler on every worker.
+
+    Atomics rather than plain Ints: `Ctx` hands the same struct to every
+    thread, so it types the sharing, it does not synchronise it.
+    """
+
+    var live: Int64
+    """How many `hold` invocations are executing right now."""
+    var peak: Int64
+    """The most that were ever executing at once."""
+
+
+def _counter(ref cell: Int64) -> AtomicCounter:
+    """An atomic view over one field. `AtomicCounter` is a view rather than an
+    owner, so the struct holds the storage and this borrows it — by field name,
+    which is the point: the compiler works out the offset, not the reader."""
+    return AtomicCounter.at(Int(UnsafePointer(to=cell)))
 
 comptime HOLD_NS: Int = 400_000_000
 """How long `hold` occupies its worker. Real time, not a durable sleep: a
@@ -46,7 +58,7 @@ back and defeat the measurement."""
 
 
 def _handle(
-    app: App, inv: Invocation, worker: Int, ctx: OpaquePtr
+    app: App, inv: Invocation, worker: Int, ctx: Ctx[Stats]
 ) raises -> None:
     """One invocation, on one of `serve`'s worker threads."""
     if inv.handler == "leaf":
@@ -59,8 +71,8 @@ def _handle(
         app.complete(inv, "chain(" + got + ")")
 
     elif inv.handler == "hold":
-        var live = AtomicCounter.at(Int(ctx) + C_LIVE * 8)
-        var peak = AtomicCounter.at(Int(ctx) + C_PEAK * 8)
+        var live = _counter(ctx[].live)
+        var peak = _counter(ctx[].peak)
         var now = Int(live.fetch_add(1)) + 1
         # Racy max, deliberately: a lost update can only *under*-report the
         # peak, so the assertion it feeds can never pass spuriously.
@@ -73,7 +85,7 @@ def _handle(
         app.complete(inv, String(now))
 
     elif inv.handler == "peak":
-        var peak = AtomicCounter.at(Int(ctx) + C_PEAK * 8)
+        var peak = _counter(ctx[].peak)
         app.complete(inv, String(Int(peak.load())))
 
     elif inv.handler == "worker":
@@ -113,11 +125,9 @@ def main() raises:
         port=port,
     )
 
-    # Heap allocated and freed after `serve` returns — `serve` joins every
-    # worker before returning, so nothing can still be reading it.
-    var block = alloc[Int64](C_CELLS)
-    block[C_LIVE] = 0
-    block[C_PEAK] = 0
+    # An ordinary local: `serve_with` joins every worker before returning, so
+    # it outlives them without a heap allocation to free by hand.
+    var stats = Stats(0, 0)
 
     print(
         "Chain listening on :",
@@ -127,8 +137,5 @@ def main() raises:
         " worker(s) — register with `restate deployments register`",
         sep="",
     )
-    var served = app.serve[_handle](
-        num_workers=workers, ctx=opaque_ptr(Int(block))
-    )
+    var served = app.serve_with[Stats, _handle](stats, num_workers=workers)
     print("stopped after", served, "invocations")
-    block.unsafe_free()

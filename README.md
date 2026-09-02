@@ -1,6 +1,6 @@
 # restate.mojo
 
-[![CI](https://github.com/millfolio/restate.mojo/actions/workflows/ci.yml/badge.svg)](https://github.com/millfolio/restate.mojo/actions/workflows/ci.yml) [![mojoshelf](https://mojoshelf.org/badge/restate-mojo.svg)](https://mojoshelf.org/tins/restate-mojo) [![mojo nightly](https://mojoshelf.org/badge/restate-mojo/nightly.svg)](https://mojoshelf.org/tins/restate-mojo)
+[![CI](https://github.com/magmalake/restate.mojo/actions/workflows/ci.yml/badge.svg)](https://github.com/magmalake/restate.mojo/actions/workflows/ci.yml) [![mojoshelf](https://mojoshelf.org/badge/restate-mojo.svg)](https://mojoshelf.org/tins/restate-mojo) [![mojo nightly](https://mojoshelf.org/badge/restate-mojo/nightly.svg)](https://mojoshelf.org/tins/restate-mojo)
 
 Durable execution flows in **Mojo**, via [Restate](https://restate.dev).
 

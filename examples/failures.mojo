@@ -139,8 +139,13 @@ def _short_id(prefix: String, key: String) -> String:
 
 
 def _step_reserve(app: App, inv: Invocation, attempt: Int) raises -> String:
-    """A journaled side effect: `run_enter` returns the recorded value on a
-    replay, and `None` the first time through."""
+    """Deliberately the long form.
+
+    `step` handles the enter/exit protocol for you, and in exchange does not
+    tell you which branch it took -- there is no way to print REPLAY from
+    outside it. This is the step whose replay the demo exists to show, so it
+    keeps the protocol. Every other step below uses `step`.
+    """
     var replayed = app.run_enter(inv)
     if replayed:
         print("[attempt ", attempt, "] REPLAY   reserve  -> ", replayed.value(), sep="")
@@ -153,54 +158,49 @@ def _step_reserve(app: App, inv: Invocation, attempt: Int) raises -> String:
 def _step_charge(
     app: App, inv: Invocation, attempt: Int, ctx: Ctx[Flow]
 ) raises -> String:
-    """The flaky step, with the fallible call *inside* the journal block.
+    """The flaky step. Raising inside the closure closes the block as a
+    non-terminal failure, so Restate runs it again -- earlier steps untouched,
+    because the handler never returned."""
+    var key = inv.key
+    var left = _cell(ctx[].failures_left)
 
-    `run_fail(terminal=False)` closes the block without journaling anything
-    and lets Restate re-run it under the SDK's own retry policy — which comes
-    back as another execute slot, hence the loop. Earlier steps are untouched
-    because the handler never returns.
-
-    Before `run_fail` existed this shape was impossible: raising between
-    `run_enter` and `run_exit` left the block open and every later attempt
-    died with "protocol error: expected rst_run_exit".
-    """
-    var slot = app.run_enter(inv)
-    while True:
-        if slot:
-            print("[attempt ", attempt, "] REPLAY   charge   -> ", slot.value(), sep="")
-            return slot.value()
-
-        if _cell(ctx[].failures_left).fetch_add(-1) > 0:
+    @parameter
+    def compute() raises -> String:
+        if left.fetch_add(-1) > 0:
             print(
                 "[attempt ", attempt,
                 "] execute  charge   -> boom: card declined (retrying in-place)",
                 sep="",
             )
-            slot = app.run_fail(inv, String("card declined"), terminal=False)
-            continue
-
-        var value = _short_id("chg", inv.key)
+            raise Error("card declined")
+        var value = _short_id("chg", key)
         print("[attempt ", attempt, "] execute  charge   -> ", value, sep="")
-        return app.run_exit(inv, value)
+        return value
+
+    return app.step[compute](inv)
 
 
 def _step_notify(app: App, inv: Invocation, attempt: Int) raises -> String:
-    """A step that is allowed to give up.
+    """Bounded: three attempts a quarter-second apart, then the step fails
+    terminally and the handler carries on without the notification."""
 
-    Plain `run_enter` leaves retries to Restate's invoker policy, which keeps
-    going indefinitely — right for a payment, wrong for a courtesy email
-    nobody is waiting on. Three attempts a quarter-second apart, then the SDK
-    fails the block terminally and the handler moves on.
-    """
-    var slot = app.run_enter_policy(
-        inv, initial_delay_ms=250, max_attempts=3
-    )
-    while True:
-        if slot:
-            print("[attempt ", attempt, "] REPLAY   notify   -> ", slot.value(), sep="")
-            return slot.value()
+    @parameter
+    def compute() raises -> String:
         print("[attempt ", attempt, "] execute  notify   -> smtp timeout", sep="")
-        slot = app.run_fail(inv, String("smtp timeout"), terminal=False)
+        raise Error("smtp timeout")
+
+    return app.step[compute](inv, initial_delay_ms=250, max_attempts=3)
+
+
+def _step_ship(app: App, inv: Invocation, attempt: Int) raises -> String:
+    var key = inv.key
+
+    @parameter
+    def compute() raises -> String:
+        print("[attempt ", attempt, "] execute  ship     -> shipped", sep="")
+        return String("shipped")
+
+    return app.step[compute](inv)
 
 
 def _step_refund(app: App, inv: Invocation, attempt: Int) raises -> String:
@@ -219,15 +219,6 @@ def _step_refund(app: App, inv: Invocation, attempt: Int) raises -> String:
     print("[attempt ", attempt, "] execute  refund   -> gateway says no, permanently", sep="")
     _ = app.run_fail(inv, String("refund rejected: account closed"), terminal=True)
     raise Error("unreachable: run_fail(terminal=True) raises")
-
-
-def _step_ship(app: App, inv: Invocation, attempt: Int) raises -> String:
-    var replayed = app.run_enter(inv)
-    if replayed:
-        print("[attempt ", attempt, "] REPLAY   ship     -> ", replayed.value(), sep="")
-        return replayed.value()
-    print("[attempt ", attempt, "] execute  ship     -> shipped", sep="")
-    return app.run_exit(inv, String("shipped"))
 
 
 def handle_process(

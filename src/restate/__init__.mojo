@@ -562,6 +562,71 @@ struct App(Movable):
         self._check(status, "run_enter_policy")
         return _bytes_to_string(self._buf())
 
+    def step[
+        f: def () raises capturing [_] -> String
+    ](
+        self,
+        inv: Invocation,
+        initial_delay_ms: Int = 0,
+        factor: Float64 = 0.0,
+        max_delay_ms: Int = 0,
+        max_attempts: Int = 0,
+        max_duration_ms: Int = 0,
+    ) raises -> String:
+        """One journaled step: replay it, or run `f` and journal what it
+        returned.
+
+            @parameter
+            def charge() raises -> String:
+                return charge_card(reservation_id)
+
+            var charge_id = app.step[charge](inv)
+
+        This is `run_enter` / `run_exit` / `run_fail` with the protocol
+        handled. It matters less for brevity than for the fact that a block
+        cannot be left open: if `f` raises, the step is closed as a
+        non-terminal failure and Restate runs it again, which is what the
+        hand-written form has to remember to do every time.
+
+        The retry arguments are `run_enter_policy`'s, and bound the retries of
+        `f` itself. Passing none leaves them to Restate's invoker policy,
+        which does not give up.
+
+        A step that should fail *terminally* — a downstream that is not coming
+        back, where the handler compensates and finishes — wants the explicit
+        protocol instead: `run_enter`, then `run_fail(terminal=True)`.
+        """
+        var bounded = (
+            initial_delay_ms > 0
+            or factor > 0.0
+            or max_delay_ms > 0
+            or max_attempts > 0
+            or max_duration_ms > 0
+        )
+        var slot: Optional[String]
+        if bounded:
+            slot = self.run_enter_policy(
+                inv,
+                initial_delay_ms=initial_delay_ms,
+                factor=factor,
+                max_delay_ms=max_delay_ms,
+                max_attempts=max_attempts,
+                max_duration_ms=max_duration_ms,
+            )
+        else:
+            slot = self.run_enter(inv)
+
+        while True:
+            if slot:
+                return slot.value()
+            try:
+                return self.run_exit(inv, f())
+            except e:
+                # Closing the block is the whole point: raising out of here
+                # would leave the journal expecting a run_exit that never
+                # comes, and every later attempt would fail on that instead.
+                slot = self.run_fail(inv, String(e), terminal=False)
+
     def run_fail(
         self, inv: Invocation, message: String, terminal: Bool = True
     ) raises -> Optional[String]:

@@ -1,6 +1,6 @@
 [workspace]
 name = "restate"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Marius S <marius@seritan.net>"]
 description = "Durable execution flows in Mojo via Restate: the Rust SDK owns the event loop and journal behind a C-ABI shim; business logic is Mojo, on one thread or N."
 preview = ["pixi-build"]
@@ -38,7 +38,7 @@ it-served = "bash test/served.sh"
 # the Mojo import stays `from restate import …`.
 [package]
 name = "restate-mojo"
-version = "0.3.0"
+version = "0.3.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }

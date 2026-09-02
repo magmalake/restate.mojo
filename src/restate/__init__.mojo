@@ -658,6 +658,29 @@ struct App(Movable):
 
     # ── served mode ────────────────────────────────────────────────────────
 
+    def serve_with[
+        T: AnyType,
+        handler: def(App, Invocation, Int, Ctx[T]) thin raises -> None,
+    ](
+        self,
+        ref state: T,
+        num_workers: Int = 0,
+    ) raises -> Int:
+        """`serve`, with the process-local state carried as a typed `Ctx[T]`.
+
+        The same driver; the only difference is that the handler receives
+        `Ctx[T]` instead of a raw `OpaquePtr`, so it can say `ctx[].field`
+        rather than computing offsets. `state` must outlive the call, which it
+        does: `serve` joins every worker before returning.
+
+        Prefer this over `serve`. The untyped form remains for handlers whose
+        state is genuinely not a single struct.
+        """
+
+        return self.serve[_typed_handler[T, handler]](
+            num_workers=num_workers, ctx=Ctx[T].to(state).opaque()
+        )
+
     def serve[
         handler: HandlerFn
     ](
@@ -740,6 +763,51 @@ struct App(Movable):
 # ── served mode: the handler contract and its plumbing ──────────────────────
 
 
+@fieldwise_init
+struct Ctx[T: AnyType](Copyable, Movable):
+    """A typed view of the process-local state `serve` hands to each handler.
+
+    Handlers must be thin, so state cannot be captured — it travels through a
+    pointer instead. `Ctx` is that pointer with its type still attached, so a
+    handler writes `ctx[].live` rather than reckoning byte offsets into an
+    untyped block.
+
+    **It does not make the state safe to share.** Every worker thread gets the
+    same `T`, concurrently. Fields that more than one handler touches have to
+    be atomics, exactly as they would through a raw pointer.
+
+    When Mojo can carry captures across a thread boundary this whole parameter
+    disappears from the signature and the state is simply captured; the body
+    keeps working with `ctx[].x` renamed to `x`.
+    """
+
+    var _ptr: UnsafePointer[Self.T, MutUntrackedOrigin]
+
+    @staticmethod
+    def to(ref state: Self.T) -> Self:
+        """A `Ctx` over `state`, which must outlive the `serve` call."""
+        return Self(
+            UnsafePointer[Self.T, MutUntrackedOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=state))
+            )
+        )
+
+    @staticmethod
+    def from_opaque(ptr: OpaquePtr) -> Self:
+        """Rebuild the typed view inside a worker, from what `serve` passed."""
+        return Self(
+            UnsafePointer[Self.T, MutUntrackedOrigin](
+                unsafe_from_address=Int(ptr)
+            )
+        )
+
+    def __getitem__(self) -> ref [MutUntrackedOrigin] Self.T:
+        return self._ptr[]
+
+    def opaque(self) -> OpaquePtr:
+        return opaque_ptr(Int(self._ptr))
+
+
 comptime HandlerFn = def(App, Invocation, Int, OpaquePtr) thin raises -> None
 """What `App.serve` runs for each invocation: `(app, inv, worker, ctx)`.
 
@@ -760,6 +828,14 @@ Restate waiting.
 
 
 # Worker context layout for `serve`, in 64-bit cells.
+def _typed_handler[
+    T: AnyType,
+    handler: def(App, Invocation, Int, Ctx[T]) thin raises -> None,
+](app: App, inv: Invocation, worker: Int, ctx: OpaquePtr) raises -> None:
+    """Adapts a `Ctx[T]` handler to the untyped `HandlerFn` the pool needs."""
+    handler(app, inv, worker, Ctx[T].from_opaque(ctx))
+
+
 comptime _SERVE_APP: Int = 0
 """Address of the caller's `App` — borrowed, never copied."""
 comptime _SERVE_USER: Int = 1

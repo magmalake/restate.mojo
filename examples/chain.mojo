@@ -23,7 +23,6 @@ invocations per object key, so a self-call between two keyed handlers would
 stall for reasons that have nothing to do with the Mojo driver.
 """
 
-from std.memory import alloc
 from std.sys import argv
 from std.time import perf_counter_ns
 
@@ -49,7 +48,7 @@ def _counter(ref cell: Int64) -> AtomicCounter:
     """An atomic view over one field. `AtomicCounter` is a view rather than an
     owner, so the struct holds the storage and this borrows it — by field name,
     which is the point: the compiler works out the offset, not the reader."""
-    return AtomicCounter.at(Int(UnsafePointer(to=cell)))
+    return AtomicCounter.at(Int(Pointer(to=cell)))
 
 comptime HOLD_NS: Int = 400_000_000
 """How long `hold` occupies its worker. Real time, not a durable sleep: a

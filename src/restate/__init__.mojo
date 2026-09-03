@@ -39,7 +39,7 @@ Payloads are raw bytes on the wire; the String helpers below treat them as
 UTF-8 (use the `_bytes` variants for binary data).
 """
 
-from std.memory import alloc
+from std.memory.alloc import unsafe_alloc
 from std.sys.info import CompilationTarget
 from std.ffi import OwnedDLHandle, c_char
 from std.os import getenv
@@ -835,16 +835,16 @@ struct App(Movable):
 
         # Heap allocated, and freed only after the join: the workers read it
         # for as long as they run, and Mojo destroys a local at its last *use*.
-        var block = alloc[Int64](_SERVE_CELLS)
+        var block = unsafe_alloc[Int64](_SERVE_CELLS)
         var cells = i64_ptr(Int(block))
         # The App's own address. Every worker borrows it back through a
         # pointer rather than receiving a copy — `App` owns an `OwnedDLHandle`,
         # and a copy (or a move) would let one worker `dlclose` the library
         # while another is inside a call through it.
-        cells[_SERVE_APP] = Int64(Int(UnsafePointer(to=self)))
-        cells[_SERVE_USER] = Int64(Int(ctx))
-        cells[_SERVE_SERVED] = 0
-        cells[_SERVE_ERRORS] = 0
+        cells[unsafe_offset=_SERVE_APP] = Int64(Int(Pointer(to=self)))
+        cells[unsafe_offset=_SERVE_USER] = Int64(Int(ctx))
+        cells[unsafe_offset=_SERVE_SERVED] = 0
+        cells[unsafe_offset=_SERVE_ERRORS] = 0
         var shared = opaque_ptr(Int(block))
 
         var pool: WorkerPool
@@ -864,7 +864,7 @@ struct App(Movable):
             block.unsafe_free()
             raise Error("restate serve could not join workers: ", String(e))
 
-        var served = Int(cells[_SERVE_SERVED])
+        var served = Int(cells[unsafe_offset=_SERVE_SERVED])
         block.unsafe_free()
         return served
 
@@ -902,14 +902,14 @@ struct Ctx[T: AnyType](Copyable, Movable):
     keeps working with `ctx[].x` renamed to `x`.
     """
 
-    var _ptr: UnsafePointer[Self.T, MutUntrackedOrigin]
+    var _ptr: Pointer[Self.T, MutUntrackedOrigin]
 
     @staticmethod
     def to(ref state: Self.T) -> Self:
         """A `Ctx` over `state`, which must outlive the `serve` call."""
         return Self(
-            UnsafePointer[Self.T, MutUntrackedOrigin](
-                unsafe_from_address=Int(UnsafePointer(to=state))
+            Pointer[Self.T, MutUntrackedOrigin](
+                unsafe_from_address=Int(Pointer(to=state))
             )
         )
 
@@ -917,7 +917,7 @@ struct Ctx[T: AnyType](Copyable, Movable):
     def from_opaque(ptr: OpaquePtr) -> Self:
         """Rebuild the typed view inside a worker, from what `serve` passed."""
         return Self(
-            UnsafePointer[Self.T, MutUntrackedOrigin](
+            Pointer[Self.T, MutUntrackedOrigin](
                 unsafe_from_address=Int(ptr)
             )
         )
@@ -1057,10 +1057,10 @@ def _serve_worker[
 ](worker: Int, ctx: OpaquePtr, stop: AtomicFlag) -> None:
     """One driver thread: pull invocations and run them until stopped."""
     var cells = i64_ptr(Int(ctx))
-    var app = UnsafePointer[App, MutUntrackedOrigin](
-        unsafe_from_address=Int(cells[_SERVE_APP])
+    var app = Pointer[App, MutUntrackedOrigin](
+        unsafe_from_address=Int(cells[unsafe_offset=_SERVE_APP])
     )
-    var user_ctx = opaque_ptr(Int(cells[_SERVE_USER]))
+    var user_ctx = opaque_ptr(Int(cells[unsafe_offset=_SERVE_USER]))
     var served = AtomicCounter.at(Int(ctx) + _SERVE_SERVED * 8)
     var errors = AtomicCounter.at(Int(ctx) + _SERVE_ERRORS * 8)
     while not stop.is_set():

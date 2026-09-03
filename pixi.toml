@@ -15,16 +15,15 @@ mojo = "==1.0.0"
 # The FFI shim is a pixi package (ffi/); pixi builds the Rust cdylib and
 # installs lib/librestatemojo.dylib into the env — no manual build step.
 restate-shim = { path = "ffi" }
-# TEMPORARY: this is the head of threads.mojo PR #4 (`typed-worker-pool`,
-# version 0.4.0), which adds the `TypedPool` served mode now depends on. Re-pin
-# to the 0.4.0 revision mojoshelf publishes once that PR is merged and released.
+# threads-mojo 0.4.0 as published on mojoshelf (`pixi shelf add threads-mojo`),
+# which adds the `TypedPool` served mode depends on.
 #
 # The rev must be identical in all three places it appears in this file
 # ([dependencies], [package.host-dependencies], [package.run-dependencies]):
 # `pixi shelf add` resolves the tin's own deps at the published rev, and a
 # mismatch gives two source records for one package ("encountered duplicate
 # records for threads-mojo-…_source.conda").
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "3e8abbf9847b1a7338854c73c050e0f44d5785ee" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
 
 [tasks]
 counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
@@ -59,7 +58,7 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 [package.host-dependencies]
 mojo-compiler = "==1.0.0"
 # threads.mojo PR #4's head — keep in step with [dependencies] above.
-threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "3e8abbf9847b1a7338854c73c050e0f44d5785ee" }
+threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.0.0"
@@ -68,4 +67,4 @@ mojo-compiler = "==1.0.0"
 mojo-compiler = "==1.0.0"
 restate-shim = { path = "ffi" }
 # threads.mojo PR #4's head — keep in step with [dependencies] above.
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "3e8abbf9847b1a7338854c73c050e0f44d5785ee" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }

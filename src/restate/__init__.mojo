@@ -12,7 +12,7 @@ business logic, driven by a synchronous loop:
 
 That loop is single-threaded, and a handler that `call`s another handler served
 by the same process therefore deadlocks. `App.serve` is the concurrent form —
-the same loop on N threads, via threads-mojo's `WorkerPool`:
+the same loop on N threads, via threads-mojo's `TypedPool`:
 
     from restate import App, Invocation, OpaquePtr
 
@@ -39,7 +39,6 @@ Payloads are raw bytes on the wire; the String helpers below treat them as
 UTF-8 (use the `_bytes` variants for binary data).
 """
 
-from std.memory import alloc
 from std.sys.info import CompilationTarget
 from std.ffi import OwnedDLHandle, c_char
 from std.os import getenv
@@ -49,8 +48,7 @@ from threads import (
     AtomicCounter,
     AtomicFlag,
     OpaquePtr,
-    WorkerPool,
-    i64_ptr,
+    TypedPool,
     num_cpus,
     opaque_ptr,
 )
@@ -786,6 +784,9 @@ struct App(Movable):
         state is genuinely not a single struct.
         """
 
+        # `Ctx.to` erases the origin, and it is the only place served mode
+        # still does: `state` is an argument of *this* call, and this call
+        # joins every worker before returning, so it outlives them all.
         return self.serve[_typed_handler[T, handler]](
             num_workers=num_workers, ctx=Ctx[T].to(state).opaque()
         )
@@ -833,25 +834,19 @@ struct App(Movable):
         if n < 1:
             n = 1
 
-        # Heap allocated, and freed only after the join: the workers read it
-        # for as long as they run, and Mojo destroys a local at its last *use*.
-        var block = alloc[Int64](_SERVE_CELLS)
-        var cells = i64_ptr(Int(block))
-        # The App's own address. Every worker borrows it back through a
-        # pointer rather than receiving a copy — `App` owns an `OwnedDLHandle`,
-        # and a copy (or a move) would let one worker `dlclose` the library
-        # while another is inside a call through it.
-        cells[_SERVE_APP] = Int64(Int(UnsafePointer(to=self)))
-        cells[_SERVE_USER] = Int64(Int(ctx))
-        cells[_SERVE_SERVED] = 0
-        cells[_SERVE_ERRORS] = 0
-        var shared = opaque_ptr(Int(block))
+        # An ordinary local, kept alive by the pool rather than by the heap:
+        # `TypedPool[_Serve[…], origin_of(shared)]` names this local's origin in
+        # its own type, so Mojo cannot destroy `shared` while `pool` exists, and
+        # the pool's destructor joins every worker before it returns. That is
+        # the whole reason there is no allocation here — see `_Serve`.
+        var shared = _Serve(Pointer(to=self), ctx)
 
-        var pool: WorkerPool
+        var pool: TypedPool[_Serve[origin_of(self)], origin_of(shared)]
         try:
-            pool = WorkerPool.start[_serve_worker[handler]](n, shared)
+            pool = TypedPool.start[_serve_worker[handler, origin_of(self)]](
+                n, shared
+            )
         except e:
-            block.unsafe_free()
             raise Error("restate serve could not start workers: ", String(e))
 
         # No `request_stop()` here: the workers leave when `next()` reports the
@@ -861,12 +856,9 @@ struct App(Movable):
         try:
             pool.join()
         except e:
-            block.unsafe_free()
             raise Error("restate serve could not join workers: ", String(e))
 
-        var served = Int(cells[_SERVE_SERVED])
-        block.unsafe_free()
-        return served
+        return Int(shared.served)
 
 
 # ── served mode: the handler contract and its plumbing ──────────────────────
@@ -902,14 +894,18 @@ struct Ctx[T: AnyType](Copyable, Movable):
     keeps working with `ctx[].x` renamed to `x`.
     """
 
-    var _ptr: UnsafePointer[Self.T, MutUntrackedOrigin]
+    var _ptr: Pointer[Self.T, MutUntrackedOrigin]
 
     @staticmethod
     def to(ref state: Self.T) -> Self:
-        """A `Ctx` over `state`, which must outlive the `serve` call."""
+        """A `Ctx` over `state`, the one erasure served mode still performs:
+        `state` is an argument of `serve_with`, which joins every worker before
+        it returns, so it outlives the workers by construction even though the
+        pointer no longer carries the origin that would say so.
+        """
         return Self(
-            UnsafePointer[Self.T, MutUntrackedOrigin](
-                unsafe_from_address=Int(UnsafePointer(to=state))
+            Pointer[Self.T, MutUntrackedOrigin](
+                unsafe_from_address=Int(Pointer(to=state))
             )
         )
 
@@ -917,7 +913,7 @@ struct Ctx[T: AnyType](Copyable, Movable):
     def from_opaque(ptr: OpaquePtr) -> Self:
         """Rebuild the typed view inside a worker, from what `serve` passed."""
         return Self(
-            UnsafePointer[Self.T, MutUntrackedOrigin](
+            Pointer[Self.T, MutUntrackedOrigin](
                 unsafe_from_address=Int(ptr)
             )
         )
@@ -1012,15 +1008,48 @@ def _dispatch[
     app.fail(inv, String("unknown handler: ", inv.handler))
 
 
-comptime _SERVE_APP: Int = 0
-"""Address of the caller's `App` — borrowed, never copied."""
-comptime _SERVE_USER: Int = 1
-"""Address of the caller's own context, passed through to the handler."""
-comptime _SERVE_SERVED: Int = 2
-"""Atomic count of invocations that completed without raising."""
-comptime _SERVE_ERRORS: Int = 3
-"""Atomic count of invocations whose handler raised."""
-comptime _SERVE_CELLS: Int = 4
+struct _Serve[app_origin: ImmOrigin](Movable):
+    """Everything a `serve` worker shares: the app, the user context, and the
+    two counters.
+
+    It is a local of `serve`, not a heap block, because `TypedPool` carries its
+    origin on the pool's type: a live pool value is a live use of this value,
+    so Mojo keeps it alive under the running workers, and the pool's destructor
+    joins before it is dropped. Until threads-mojo grew that, the same guarantee
+    had to be bought with `unsafe_alloc` and a free after the join, because an
+    untracked pointer is not a *use* and Mojo destroys a local at its last one.
+
+    `app` is a pointer, never a copy or a move: `App` owns an `OwnedDLHandle`,
+    and a copy (or a move) would let one worker `dlclose` the library while
+    another is inside a call through it. The origin is the real one — `serve`'s
+    `self` — so the compiler checks that too.
+
+    Parameters:
+        app_origin: The origin of the `App` this pool serves, i.e. `serve`'s
+            own `self`.
+    """
+
+    var app: Pointer[App, Self.app_origin]
+    """The caller's `App` — borrowed, never copied."""
+    var ctx: OpaquePtr
+    """The caller's own context, passed straight through to the handler."""
+    var served: Int64
+    """Count of invocations that completed without raising. Read and written
+    atomically by every worker through `AtomicCounter.at`."""
+    var errors: Int64
+    """Count of invocations whose handler raised, likewise atomic."""
+
+    def __init__(out self, app: Pointer[App, Self.app_origin], ctx: OpaquePtr):
+        """Both counters start at zero.
+
+        Args:
+            app: A pointer to the `App` whose loop the workers run.
+            ctx: The process-local state handed to every handler.
+        """
+        self.app = app
+        self.ctx = ctx
+        self.served = 0
+        self.errors = 0
 
 
 def _serve_one[
@@ -1036,9 +1065,9 @@ def _serve_one[
     """Run one invocation and swallow whatever it throws.
 
     `app` is a plain borrow. That is the whole point of this function existing
-    separately: the worker holds only a raw address for the `App`, and passing
-    `app_ptr[]` into a borrowing parameter is what keeps the `OwnedDLHandle`
-    from being moved out from under the other workers.
+    separately: the worker holds only a pointer to the `App`, and passing
+    `s.app[]` into a borrowing parameter is what keeps the `OwnedDLHandle` from
+    being moved out from under the other workers.
     """
     try:
         handler(app, inv, worker, user_ctx)
@@ -1053,20 +1082,19 @@ def _serve_one[
 
 
 def _serve_worker[
-    handler: HandlerFn
-](worker: Int, ctx: OpaquePtr, stop: AtomicFlag) -> None:
-    """One driver thread: pull invocations and run them until stopped."""
-    var cells = i64_ptr(Int(ctx))
-    var app = UnsafePointer[App, MutUntrackedOrigin](
-        unsafe_from_address=Int(cells[_SERVE_APP])
-    )
-    var user_ctx = opaque_ptr(Int(cells[_SERVE_USER]))
-    var served = AtomicCounter.at(Int(ctx) + _SERVE_SERVED * 8)
-    var errors = AtomicCounter.at(Int(ctx) + _SERVE_ERRORS * 8)
+    handler: HandlerFn, app_origin: ImmOrigin
+](worker: Int, mut s: _Serve[app_origin], stop: AtomicFlag) -> None:
+    """One driver thread: pull invocations and run them until stopped.
+
+    A `PoolTaskFn[_Serve[app_origin]]`: `TypedPool` does the `void *` round trip
+    pthread demands, so the shared state arrives here already typed.
+    """
+    var served = AtomicCounter.at(Int(Pointer(to=s.served)))
+    var errors = AtomicCounter.at(Int(Pointer(to=s.errors)))
     while not stop.is_set():
         try:
-            var inv = app[]._next()
-            _serve_one[handler](app[], inv^, worker, user_ctx, served, errors)
+            var inv = s.app[]._next()
+            _serve_one[handler](s.app[], inv^, worker, s.ctx, served, errors)
         except:
             # `next()` raised: either `stop()` was called, or the endpoint
             # died. Both mean this worker is finished. The pool's own stop flag

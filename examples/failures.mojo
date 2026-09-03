@@ -120,7 +120,7 @@ struct Flow(Copyable, Movable):
 
 def _cell(ref c: Int64) -> AtomicCounter:
     """An atomic view over one field, by name rather than by offset."""
-    return AtomicCounter.at(Int(UnsafePointer(to=c)))
+    return AtomicCounter.at(Int(Pointer(to=c)))
 
 comptime DEFAULT_FAILURES = 1
 """How many times `charge` throws before it succeeds, unless `--fail` says
@@ -193,8 +193,6 @@ def _step_notify(app: App, inv: Invocation, attempt: Int) raises -> String:
 
 
 def _step_ship(app: App, inv: Invocation, attempt: Int) raises -> String:
-    var key = inv.key
-
     @parameter
     def compute() raises -> String:
         print("[attempt ", attempt, "] execute  ship     -> shipped", sep="")

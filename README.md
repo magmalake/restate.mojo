@@ -52,9 +52,12 @@ def main() raises:
 ## Serving concurrently
 
 `App.run` serves on `num_workers` OS threads
-([threads-mojo](https://github.com/magmalake/threads.mojo)'s `WorkerPool`),
+([threads-mojo](https://github.com/magmalake/threads.mojo)'s `TypedPool`),
 defaulting to one per core, and returns the number of invocations that
-completed once `app.stop()` has been called.
+completed once `app.stop()` has been called. The state the workers share — the
+app pointer, your `ctx`, the counters — is an ordinary local of `serve`, held
+alive by the pool: a `TypedPool` names that local's origin in its own type, so
+the compiler will not destroy it under the running threads.
 
 **There is no single-threaded driver.** Until 0.3.0 you could write the loop
 yourself over `app.next()`; it deadlocked the moment a handler called another

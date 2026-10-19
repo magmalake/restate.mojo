@@ -5,25 +5,26 @@ authors = ["Marius S <marius@seritan.net>"]
 description = "Durable execution flows in Mojo via Restate: the Rust SDK owns the event loop and journal behind a C-ABI shim; business logic is Mojo, on one thread or N."
 preview = ["pixi-build"]
 channels = [
-    "https://conda.modular.com/max-nightly",
+    "https://conda.modular.com/max",
     "conda-forge",
 ]
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [dependencies]
-mojo = "==1.0.0"
+mojo = "==1.1.0"
 # The FFI shim is a pixi package (ffi/); pixi builds the Rust cdylib and
 # installs lib/librestatemojo.dylib into the env — no manual build step.
 restate-shim = { path = "ffi" }
-# threads-mojo 0.4.0 as published on mojoshelf (`pixi shelf add threads-mojo`),
-# which adds the `TypedPool` served mode depends on.
+# threads-mojo 0.6.0 as published on mojoshelf (`pixi shelf add threads-mojo`):
+# the first release built with Mojo 1.1.0, and it has the `TypedPool` served
+# mode depends on.
 #
 # The rev must be identical in all three places it appears in this file
 # ([dependencies], [package.host-dependencies], [package.run-dependencies]):
 # `pixi shelf add` resolves the tin's own deps at the published rev, and a
 # mismatch gives two source records for one package ("encountered duplicate
 # records for threads-mojo-…_source.conda").
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
 
 [tasks]
 counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
@@ -56,15 +57,15 @@ name = "restate"
 extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
-mojo-compiler = "==1.0.0"
-# threads.mojo PR #4's head — keep in step with [dependencies] above.
-threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
+mojo-compiler = "==1.1.0"
+# threads-mojo 0.6.0 — keep in step with [dependencies] above.
+threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
 
 [package.build-dependencies]
-mojo-compiler = "==1.0.0"
+mojo-compiler = "==1.1.0"
 
 [package.run-dependencies]
-mojo-compiler = "==1.0.0"
+mojo-compiler = ">=1.1.0,<2"
 restate-shim = { path = "ffi" }
-# threads.mojo PR #4's head — keep in step with [dependencies] above.
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "772dd842d4222aeae48e4eda9766ff2edec1bdff" }
+# threads-mojo 0.6.0 — keep in step with [dependencies] above.
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "e8790abf928c96073a5457462558cad9cb52656d" }

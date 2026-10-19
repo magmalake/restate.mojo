@@ -151,7 +151,7 @@ curl localhost:8080/Orders/order-1/process --json '{}'
 [attempt 2] execute  ship     -> shipped
 ```
 
-Most steps there are one call — `app.step[compute](inv)` replays or runs the
+Most steps there are one call — `app.step(inv, compute)` replays or runs the
 closure and journals it, with the enter/exit protocol handled. It also shows
 bounded retries (three attempts, then give up) and the three ways to fail,
 which are not interchangeable:

@@ -561,10 +561,11 @@ struct App(Movable):
         return _bytes_to_string(self._buf())
 
     def step[
-        f: def () raises capturing [_] -> String
+        F: def () raises -> String
     ](
         self,
         inv: Invocation,
+        f: F,
         initial_delay_ms: Int = 0,
         factor: Float64 = 0.0,
         max_delay_ms: Int = 0,
@@ -574,11 +575,14 @@ struct App(Movable):
         """One journaled step: replay it, or run `f` and journal what it
         returned.
 
-            @parameter
-            def charge() raises -> String:
+            def charge() raises {imm reservation_id} -> String:
                 return charge_card(reservation_id)
 
-            var charge_id = app.step[charge](inv)
+            var charge_id = app.step(inv, charge)
+
+        `f` is passed by value with an explicit capture list, which keeps
+        what it captures alive until `step` returns. Its type is a parameter,
+        so each closure still gets its own monomorphised `step`.
 
         This is `run_enter` / `run_exit` / `run_fail` with the protocol
         handled. It matters less for brevity than for the fact that a block

@@ -164,8 +164,7 @@ def _step_charge(
     var key = inv.key
     var left = _cell(ctx[].failures_left)
 
-    @parameter
-    def compute() raises -> String:
+    def compute() raises {imm left, imm attempt, imm key} -> String:
         if left.fetch_add(-1) > 0:
             print(
                 "[attempt ", attempt,
@@ -177,28 +176,26 @@ def _step_charge(
         print("[attempt ", attempt, "] execute  charge   -> ", value, sep="")
         return value
 
-    return app.step[compute](inv)
+    return app.step(inv, compute)
 
 
 def _step_notify(app: App, inv: Invocation, attempt: Int) raises -> String:
     """Bounded: three attempts a quarter-second apart, then the step fails
     terminally and the handler carries on without the notification."""
 
-    @parameter
-    def compute() raises -> String:
+    def compute() raises {imm attempt} -> String:
         print("[attempt ", attempt, "] execute  notify   -> smtp timeout", sep="")
         raise Error("smtp timeout")
 
-    return app.step[compute](inv, initial_delay_ms=250, max_attempts=3)
+    return app.step(inv, compute, initial_delay_ms=250, max_attempts=3)
 
 
 def _step_ship(app: App, inv: Invocation, attempt: Int) raises -> String:
-    @parameter
-    def compute() raises -> String:
+    def compute() raises {imm attempt} -> String:
         print("[attempt ", attempt, "] execute  ship     -> shipped", sep="")
         return String("shipped")
 
-    return app.step[compute](inv)
+    return app.step(inv, compute)
 
 
 def _step_refund(app: App, inv: Invocation, attempt: Int) raises -> String:

@@ -202,18 +202,22 @@ struct App(Movable):
 
     def _check(self, status: Int, what: String) raises:
         """Raise on non-OK statuses shared by most operations."""
-        if status == STATUS_OK:
-            return
-        if status == STATUS_GONE:
-            raise Error(SUSPENDED_MSG)
-        if status == STATUS_TERMINAL:
-            raise Error(
-                "restate terminal error in "
-                + what
-                + ": "
-                + _bytes_to_string(self._buf())
-            )
-        raise Error("restate " + what + " failed: " + self._last_error())
+        match status:
+            case == STATUS_OK:
+                return
+            case == STATUS_GONE:
+                raise Error(SUSPENDED_MSG)
+            case == STATUS_TERMINAL:
+                raise Error(
+                    "restate terminal error in "
+                    + what
+                    + ": "
+                    + _bytes_to_string(self._buf())
+                )
+            case _:
+                raise Error(
+                    "restate " + what + " failed: " + self._last_error()
+                )
 
     def _next(self) raises -> Invocation:
         """Block until Restate delivers the next invocation.

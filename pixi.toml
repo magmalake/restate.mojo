@@ -1,6 +1,6 @@
 [workspace]
 name = "restate"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Marius S <marius@seritan.net>"]
 description = "Durable execution flows in Mojo via Restate: the Rust SDK owns the event loop and journal behind a C-ABI shim; business logic is Mojo, on one thread or N."
 preview = ["pixi-build"]
@@ -24,7 +24,7 @@ restate-shim = { path = "ffi" }
 # `pixi shelf add` resolves the tin's own deps at the published rev, and a
 # mismatch gives two source records for one package ("encountered duplicate
 # records for threads-mojo-…_source.conda").
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }
 
 [tasks]
 counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
@@ -43,7 +43,7 @@ it-served = "bash test/served.sh"
 # the Mojo import stays `from restate import …`.
 [package]
 name = "restate-mojo"
-version = "0.4.0"
+version = "0.4.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -59,7 +59,7 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 [package.host-dependencies]
 mojo-compiler = "==1.2.0"
 # threads-mojo 0.6.0 — keep in step with [dependencies] above.
-threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
+threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.2.0"
@@ -68,4 +68,4 @@ mojo-compiler = "==1.2.0"
 mojo-compiler = ">=1.2.0,<2"
 restate-shim = { path = "ffi" }
 # threads-mojo 0.6.0 — keep in step with [dependencies] above.
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }

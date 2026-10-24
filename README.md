@@ -176,7 +176,7 @@ invocation for good.
 - **`num_workers=1` still deadlocks** if a handler `call`s a handler served by
   the same process — there is no second thread to run the callee. The default
   is one worker per core, so you have to ask for this to happen.
-- CI runs both end-to-end gates on macOS and Linux with `mojo == 1.1.0`;
+- CI runs both end-to-end gates on macOS and Linux with `mojo == 1.2.0`;
   linux-64 was previously untested and passes. Workflow mode is wired
   through discovery but has no end-to-end gate yet.
 

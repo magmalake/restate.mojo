@@ -7,13 +7,40 @@ on:
   pull_request:
 
 jobs:
+  # A release PR (only versions, CHANGELOG.md, revs and locks change; see
+  # tools/release_only.py in magmalake/.github) skips the macOS, nightly and
+  # extra jobs below and runs a consumer build of the PR head instead. Every
+  # other PR runs everything. The verdict is its own fast job because the jobs
+  # below wait for it; the builds are the next one.
+  release:
+    if: github.event_name == 'pull_request'
+    uses: magmalake/.github/.github/workflows/release-check.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      classify-only: true
+
+  release-check:
+    needs: release
+    if: needs.release.outputs.release_only == 'true'
+    uses: magmalake/.github/.github/workflows/release-check.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      # The unit tests run in the stable / ubuntu-latest job below.
+      task: ""
+
   test:
+    needs: release
+    if: ${{ !cancelled() }}
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: ${{ fromJSON(needs.release.outputs.release_only == 'true' && '["ubuntu-latest"]' || '["macos-latest", "ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,3 +79,29 @@ jobs:
           RESTATE_IT_NODE: 25122
           RESTATE_IT_ENDPOINT: 29080
         run: pixi run it-served
+
+  # The one check to require: every job above passed or, on a release-only PR,
+  # was skipped in favour of the release job's consumer build.
+  ci:
+    if: ${{ always() }}
+    needs: [release, release-check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          release = needs.pop("release")
+          build = needs.pop("release-check", {"result": "skipped"})
+          release_only = release["outputs"].get("release_only") == "true"
+          ok = {"success", "skipped"} if release_only else {"success"}
+          bad = {k: v["result"] for k, v in needs.items() if v["result"] not in ok}
+          for k, v in (("release", release), ("release-check", build)):
+              if v["result"] not in ("success", "skipped"):
+                  bad[k] = v["result"]
+          print("release-only:", release_only, "results:", {k: v["result"] for k, v in needs.items()})
+          if bad:
+              sys.exit(f"did not succeed: {bad}")
+          PY

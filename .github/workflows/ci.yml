@@ -9,7 +9,7 @@ on:
   # PRs or main: GitHub's hosted macOS pool is short on capacity, and a job
   # that never gets a runner fails the required `ci` gate.
   schedule:
-    - cron: '60 7 * * *'
+    - cron: '12 8 * * *'
 
 jobs:
   # A release PR (only versions, CHANGELOG.md, revs and locks change; see

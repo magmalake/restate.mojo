@@ -29,18 +29,19 @@ jobs:
       contents: read
       pull-requests: read
     with:
-      # The unit tests run in the stable / ubuntu-latest job below.
+      # The test legs below are skipped on release PRs, and the consumer build
+      # is the check (the tests need the Rust toolchain and Node, which the shared job does not set up).
       task: ""
 
   test:
     needs: release
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.release.outputs.release_only != 'true' }}
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.release.outputs.release_only == 'true' && '["ubuntu-latest"]' || '["macos-latest", "ubuntu-latest"]') }}
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 

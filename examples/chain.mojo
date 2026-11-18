@@ -27,7 +27,7 @@ from std.sys import argv
 from std.time import perf_counter_ns
 
 from restate import App, Ctx, Invocation
-from threads import AtomicCounter, OpaquePtr, i64_ptr, num_cpus, opaque_ptr
+from threads import AtomicCounter, num_cpus
 
 
 @fieldwise_init

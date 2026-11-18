@@ -18,7 +18,7 @@ This service keeps nothing in process memory: everything it remembers lives in
 Restate state, keyed by the object key. `Ctx[Unit]` is the way to say so.
 """
 
-from restate import App, Ctx, Invocation, Unit, is_suspended
+from restate import App, Ctx, Invocation, Unit
 from std.sys import argv
 
 

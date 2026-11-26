@@ -15,7 +15,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 # version that built it, so the pin is exact here and in [package] below, and
 # it moves across all magmalake tins together.
 [dependencies]
-mojo = "==1.3.0.dev2026112505"
+mojo = "==1.3.0.dev2026112605"
 # The FFI shim is a pixi package (ffi/); pixi builds the Rust cdylib and
 # installs lib/librestatemojo.dylib into the env — no manual build step.
 restate-shim = { path = "ffi" }
@@ -29,7 +29,7 @@ restate-shim = { path = "ffi" }
 # `pixi shelf add` resolves the tin's own deps at the published rev, and a
 # mismatch gives two source records for one package ("encountered duplicate
 # records for threads-mojo-…_source.conda").
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "d86b368e4aabb3c9a09b0f54d117230a404e4258" }
 
 [tasks]
 counter = "mkdir -p build && mojo build examples/counter.mojo -I src -o build/counter && ./build/counter"
@@ -62,15 +62,15 @@ name = "restate"
 extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
-mojo-compiler = "==1.3.0.dev2026112505"
+mojo-compiler = "==1.3.0.dev2026112605"
 # threads-mojo — keep in step with [dependencies] above.
-threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
+threads-mojo ={ git = "https://github.com/magmalake/threads.mojo", rev = "d86b368e4aabb3c9a09b0f54d117230a404e4258" }
 
 [package.build-dependencies]
-mojo-compiler = "==1.3.0.dev2026112505"
+mojo-compiler = "==1.3.0.dev2026112605"
 
 [package.run-dependencies]
-mojo-compiler = "==1.3.0.dev2026112505"
+mojo-compiler = "==1.3.0.dev2026112605"
 restate-shim = { path = "ffi" }
 # threads-mojo — keep in step with [dependencies] above.
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "d86b368e4aabb3c9a09b0f54d117230a404e4258" }
